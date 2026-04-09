@@ -17,6 +17,16 @@ struct MonitorConfig {
     model_size: String,
     language: String,
     profanity_file: String,
+    input_source: String,
+    input_device: String,
+    lyrics_mode: bool,
+    spotify_token: String,
+    playlist_id: String,
+    prefetch_playlist_lyrics: bool,
+    lyrics_preduck_seconds: f32,
+    import_playlist_csv_paths: String,
+    prefetch_csv_lyrics: bool,
+    prefetch_only: bool,
 }
 
 #[derive(Clone, Default)]
@@ -50,12 +60,61 @@ async fn start_monitor(
         config.model_size,
         "--language".to_string(),
         config.language,
+        "--input-source".to_string(),
+        config.input_source,
     ];
 
     if !config.profanity_file.trim().is_empty() {
         args.push("--profanity-file".to_string());
         args.push(config.profanity_file);
     }
+
+    if !config.input_device.trim().is_empty() {
+        args.push("--input-device".to_string());
+        args.push(config.input_device);
+    }
+
+    if config.lyrics_mode {
+        args.push("--lyrics-mode".to_string());
+    }
+
+    if !config.spotify_token.trim().is_empty() {
+        args.push("--spotify-token".to_string());
+        args.push(config.spotify_token);
+    }
+
+    if !config.playlist_id.trim().is_empty() {
+        args.push("--playlist-id".to_string());
+        args.push(config.playlist_id);
+    }
+
+    if config.prefetch_playlist_lyrics {
+        args.push("--prefetch-playlist-lyrics".to_string());
+    }
+
+    let csv_paths: Vec<String> = config
+        .import_playlist_csv_paths
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if config.prefetch_csv_lyrics || !csv_paths.is_empty() {
+        args.push("--prefetch-csv-lyrics".to_string());
+    }
+
+    for csv_path in csv_paths {
+        args.push("--import-playlist-csv".to_string());
+        args.push(csv_path);
+    }
+
+    if config.prefetch_only {
+        args.push("--prefetch-only".to_string());
+    }
+
+    args.push("--lyrics-preduck-seconds".to_string());
+    args.push(config.lyrics_preduck_seconds.to_string());
 
     let sidecar = app
         .shell()

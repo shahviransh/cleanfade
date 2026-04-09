@@ -10,6 +10,7 @@ const appendLog = (line) => {
 
 const getNum = (id) => Number.parseFloat(document.getElementById(id).value);
 const getText = (id) => document.getElementById(id).value.trim();
+const getBool = (id) => document.getElementById(id).checked;
 
 const getConfig = () => ({
   sample_rate: 16000,
@@ -20,6 +21,16 @@ const getConfig = () => ({
   model_size: getText("modelSize"),
   language: getText("language") || "en",
   profanity_file: getText("profanityFile"),
+  input_source: getText("inputSource") || "loopback",
+  input_device: getText("inputDevice"),
+  lyrics_mode: getBool("lyricsMode"),
+  spotify_token: getText("spotifyToken"),
+  playlist_id: getText("playlistId"),
+  prefetch_playlist_lyrics: getBool("prefetchPlaylistLyrics"),
+  lyrics_preduck_seconds: getNum("lyricsPreduckSeconds"),
+  import_playlist_csv_paths: getText("playlistCsvPaths"),
+  prefetch_csv_lyrics: getBool("prefetchCsvLyrics"),
+  prefetch_only: getBool("prefetchOnly"),
 });
 
 const setRunning = (running) => {

@@ -1,19 +1,25 @@
 import argparse
+import csv
+import hashlib
+import json
 import logging
 import math
 import os
 import re
 import signal
 import sys
+import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Keep COM in MTA mode so pycaw/comtypes matches thread state set by other audio libs.
 sys.coinit_flags = 0
 
 import numpy as np
+import requests
 import soundcard as sc
 from faster_whisper import WhisperModel
 
@@ -33,6 +39,8 @@ DEFAULT_BAD_WORDS = {
     "shit",
 }
 
+TOKEN_RE = re.compile(r"[a-z0-9']+")
+
 
 def configure_huggingface_runtime() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -49,7 +57,7 @@ def configure_huggingface_runtime() -> None:
 
 def build_word_regex(words: set[str]) -> re.Pattern[str]:
     escaped = sorted((re.escape(word) for word in words), key=len, reverse=True)
-    pattern = r"\\b(?:" + "|".join(escaped) + r")\\b"
+    pattern = r"\b(?:" + "|".join(escaped) + r")\b"
     return re.compile(pattern, re.IGNORECASE)
 
 
@@ -81,6 +89,46 @@ class DuckState:
     baseline_volume: float = 1.0
     is_ducked: bool = False
     ducked_until: float = 0.0
+
+
+@dataclass
+class LyricsMonitorState:
+    current_track_id: str = ""
+    current_track_name: str = ""
+    profanity_timestamps_ms: list[int] = field(default_factory=list)
+    lyrics_lines: list["LyricLine"] = field(default_factory=list)
+    triggered_timestamps_ms: set[int] = field(default_factory=set)
+    current_line_index: int = -1
+    current_progress_ms: int = -1
+    last_alignment_ms: int = -1
+    no_match_chunks: int = 0
+    lyrics_library: list["LyricsLibraryTrack"] = field(default_factory=list)
+    last_poll_time: float = 0.0
+    last_error: str = ""
+
+
+@dataclass
+class LyricLine:
+    timestamp_ms: int
+    text: str
+    normalized: str
+    token_set: set[str]
+    has_profanity: bool
+
+
+@dataclass
+class TrackLyricsData:
+    profanity_timestamps_ms: list[int]
+    lyrics_lines: list[LyricLine]
+
+
+@dataclass
+class LyricsLibraryTrack:
+    track_id: str
+    track_name: str
+    artist_name: str
+    profanity_timestamps_ms: list[int]
+    lyrics_lines: list[LyricLine]
 
 
 class SpotifyVolumeController:
@@ -167,6 +215,766 @@ def transcribe_chunk(
     return " ".join(segment.text.strip() for segment in segments if segment.text).strip()
 
 
+def _spotify_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _extract_track_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    item = payload.get("item")
+    if not item:
+        return None
+
+    track_id = item.get("id")
+    if not track_id:
+        return None
+
+    artists = item.get("artists") or []
+    artist_name = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+
+    return {
+        "track_id": track_id,
+        "track_name": item.get("name", ""),
+        "artist_name": artist_name,
+        "progress_ms": int(payload.get("progress_ms") or 0),
+        "is_playing": bool(payload.get("is_playing")),
+    }
+
+
+def get_current_spotify_track(token: str) -> dict[str, Any] | None:
+    response = requests.get(
+        "https://api.spotify.com/v1/me/player/currently-playing",
+        headers=_spotify_headers(token),
+        timeout=5,
+    )
+
+    if response.status_code == 204:
+        # Fallback endpoint is sometimes more reliable depending on client/device state.
+        response = requests.get(
+            "https://api.spotify.com/v1/me/player",
+            headers=_spotify_headers(token),
+            timeout=5,
+        )
+        if response.status_code == 204:
+            return None
+
+    if response.status_code == 401:
+        raise RuntimeError("Spotify token is invalid or expired.")
+
+    if response.status_code == 403:
+        raise RuntimeError(
+            "Spotify token missing required scope. Add 'user-read-currently-playing' and 'user-read-playback-state'."
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Spotify API returned {response.status_code}: {response.text[:200]}")
+
+    payload = response.json()
+    return _extract_track_payload(payload)
+
+
+def fetch_synced_lyrics(track_name: str, artist_name: str) -> str | None:
+    response = requests.get(
+        "https://lrclib.net/api/search",
+        params={"track_name": track_name, "artist_name": artist_name},
+        timeout=8,
+    )
+
+    if response.status_code >= 400:
+        return None
+
+    entries = response.json()
+    if not isinstance(entries, list):
+        return None
+
+    for entry in entries:
+        synced = entry.get("syncedLyrics")
+        if synced:
+            return str(synced)
+
+    return None
+
+
+def normalize_lyric_text(value: str) -> str:
+    lowered = value.lower()
+    tokens = TOKEN_RE.findall(lowered)
+    return " ".join(tokens)
+
+
+def tokenize_lyric_text(value: str) -> set[str]:
+    return set(TOKEN_RE.findall(value.lower()))
+
+
+def parse_synced_lyrics_lines(synced_lyrics: str, profanity_pattern: re.Pattern[str]) -> list[LyricLine]:
+    lines: list[LyricLine] = []
+    line_pattern = re.compile(r"^\[(\d{1,2}):(\d{2}(?:\.\d+)?)\](.*)$")
+
+    for raw_line in synced_lyrics.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = line_pattern.match(line)
+        if not match:
+            continue
+
+        minutes = int(match.group(1))
+        seconds = float(match.group(2))
+        text = match.group(3).strip()
+        if not text:
+            continue
+
+        normalized = normalize_lyric_text(text)
+        if not normalized:
+            continue
+
+        timestamp_ms = int((minutes * 60 + seconds) * 1000)
+        lines.append(
+            LyricLine(
+                timestamp_ms=timestamp_ms,
+                text=text,
+                normalized=normalized,
+                token_set=tokenize_lyric_text(normalized),
+                has_profanity=bool(profanity_pattern.search(normalized)),
+            )
+        )
+
+    lines.sort(key=lambda item: item.timestamp_ms)
+    return lines
+
+
+def extract_profanity_timestamps_ms(lyrics_lines: list[LyricLine]) -> list[int]:
+    timestamps = [line.timestamp_ms for line in lyrics_lines if line.has_profanity]
+
+    return sorted(set(timestamps))
+
+
+def _lyrics_cache_path(cache_dir: Path, track_id: str) -> Path:
+    return cache_dir / f"{track_id}.json"
+
+
+def _parse_cached_lyrics_lines(raw_lines: Any, profanity_pattern: re.Pattern[str]) -> list[LyricLine]:
+    if not isinstance(raw_lines, list):
+        return []
+
+    parsed: list[LyricLine] = []
+    for item in raw_lines:
+        if not isinstance(item, dict):
+            continue
+
+        timestamp = item.get("timestamp_ms")
+        text = item.get("text")
+        if not isinstance(timestamp, int) or not isinstance(text, str):
+            continue
+
+        normalized = normalize_lyric_text(text)
+        if not normalized:
+            continue
+
+        parsed.append(
+            LyricLine(
+                timestamp_ms=timestamp,
+                text=text,
+                normalized=normalized,
+                token_set=tokenize_lyric_text(normalized),
+                has_profanity=bool(profanity_pattern.search(normalized)),
+            )
+        )
+
+    parsed.sort(key=lambda item: item.timestamp_ms)
+    return parsed
+
+
+def load_cached_track_lyrics(
+    cache_dir: Path,
+    track_id: str,
+    profanity_pattern: re.Pattern[str],
+) -> TrackLyricsData | None:
+    cache_file = _lyrics_cache_path(cache_dir, track_id)
+    if not cache_file.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    lyrics_lines = _parse_cached_lyrics_lines(payload.get("lyrics_lines"), profanity_pattern)
+    if lyrics_lines:
+        return TrackLyricsData(
+            profanity_timestamps_ms=extract_profanity_timestamps_ms(lyrics_lines),
+            lyrics_lines=lyrics_lines,
+        )
+
+    timestamps = payload.get("profanity_timestamps_ms")
+    if not isinstance(timestamps, list):
+        return None
+
+    normalized: list[int] = []
+    for item in timestamps:
+        if isinstance(item, int):
+            normalized.append(item)
+
+    return TrackLyricsData(profanity_timestamps_ms=normalized, lyrics_lines=[])
+
+
+def save_cached_lyrics_timestamps(
+    cache_dir: Path,
+    track_id: str,
+    track_name: str,
+    artist_name: str,
+    profanity_timestamps_ms: list[int],
+    lyrics_lines: list[LyricLine],
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "track_id": track_id,
+        "track_name": track_name,
+        "artist_name": artist_name,
+        "profanity_timestamps_ms": profanity_timestamps_ms,
+        "lyrics_lines": [
+            {
+                "timestamp_ms": line.timestamp_ms,
+                "text": line.text,
+            }
+            for line in lyrics_lines
+        ],
+    }
+    cache_file = _lyrics_cache_path(cache_dir, track_id)
+    temp_file = cache_file.with_name(
+        f"{cache_file.name}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    )
+
+    try:
+        temp_file.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        os.replace(temp_file, cache_file)
+    finally:
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+        except OSError:
+            pass
+
+
+def get_track_lyrics_data(
+    track_id: str,
+    track_name: str,
+    artist_name: str,
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> TrackLyricsData:
+    cached = load_cached_track_lyrics(cache_dir, track_id, profanity_pattern)
+    if cached is not None and cached.lyrics_lines:
+        return cached
+
+    # Legacy cache entries may only include profanity timestamps.
+    # Refresh once to upgrade cache with full synced lyric lines.
+    if cached is not None and not cached.lyrics_lines:
+        synced_lyrics = fetch_synced_lyrics(track_name, artist_name)
+        if not synced_lyrics:
+            return cached
+
+        lyrics_lines = parse_synced_lyrics_lines(synced_lyrics, profanity_pattern)
+        profanity_timestamps_ms = extract_profanity_timestamps_ms(lyrics_lines)
+        upgraded = TrackLyricsData(profanity_timestamps_ms=profanity_timestamps_ms, lyrics_lines=lyrics_lines)
+        save_cached_lyrics_timestamps(
+            cache_dir,
+            track_id,
+            track_name,
+            artist_name,
+            upgraded.profanity_timestamps_ms,
+            upgraded.lyrics_lines,
+        )
+        return upgraded
+
+    synced_lyrics = fetch_synced_lyrics(track_name, artist_name)
+    if not synced_lyrics:
+        empty_data = TrackLyricsData(profanity_timestamps_ms=[], lyrics_lines=[])
+        save_cached_lyrics_timestamps(
+            cache_dir,
+            track_id,
+            track_name,
+            artist_name,
+            empty_data.profanity_timestamps_ms,
+            empty_data.lyrics_lines,
+        )
+        return empty_data
+
+    lyrics_lines = parse_synced_lyrics_lines(synced_lyrics, profanity_pattern)
+    profanity_timestamps_ms = extract_profanity_timestamps_ms(lyrics_lines)
+    data = TrackLyricsData(profanity_timestamps_ms=profanity_timestamps_ms, lyrics_lines=lyrics_lines)
+    save_cached_lyrics_timestamps(
+        cache_dir,
+        track_id,
+        track_name,
+        artist_name,
+        data.profanity_timestamps_ms,
+        data.lyrics_lines,
+    )
+    return data
+
+
+def fetch_playlist_tracks(token: str, playlist_id: str) -> list[tuple[str, str, str]]:
+    tracks: list[tuple[str, str, str]] = []
+    offset = 0
+
+    while True:
+        response = requests.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers=_spotify_headers(token),
+            params={"limit": 100, "offset": offset},
+            timeout=8,
+        )
+
+        if response.status_code == 401:
+            raise RuntimeError("Spotify token is invalid or expired.")
+        if response.status_code >= 400:
+            raise RuntimeError(f"Spotify playlist API returned {response.status_code}: {response.text[:200]}")
+
+        payload = response.json()
+        items = payload.get("items") or []
+        for item in items:
+            track = item.get("track") or {}
+            track_id = track.get("id")
+            if not track_id:
+                continue
+
+            track_name = track.get("name", "")
+            artists = track.get("artists") or []
+            artist_name = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+            tracks.append((track_id, track_name, artist_name))
+
+        if not payload.get("next"):
+            break
+
+        offset += len(items)
+        if not items:
+            break
+
+    return tracks
+
+
+def prefetch_playlist_lyrics(
+    token: str,
+    playlist_id: str,
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> tuple[int, int]:
+    tracks = fetch_playlist_tracks(token, playlist_id)
+    with_profanity = 0
+
+    for track_id, track_name, artist_name in tracks:
+        data = get_track_lyrics_data(
+            track_id=track_id,
+            track_name=track_name,
+            artist_name=artist_name,
+            profanity_pattern=profanity_pattern,
+            cache_dir=cache_dir,
+        )
+        if data.profanity_timestamps_ms:
+            with_profanity += 1
+
+    return len(tracks), with_profanity
+
+
+def _first_artist_name(raw_artist: str) -> str:
+    value = raw_artist.strip()
+    if not value:
+        return ""
+
+    if ";" in value:
+        return value.split(";", 1)[0].strip()
+
+    return value
+
+
+def _csv_field(row: dict[str, str], lower_to_real: dict[str, str], candidates: list[str]) -> str:
+    for candidate in candidates:
+        real_name = lower_to_real.get(candidate.lower())
+        if not real_name:
+            continue
+        return (row.get(real_name) or "").strip()
+    return ""
+
+
+def _is_exportify_header(lower_to_real: dict[str, str]) -> bool:
+    return "track name" in lower_to_real and "artist name(s)" in lower_to_real
+
+
+def _is_tunemymusic_header(lower_to_real: dict[str, str]) -> bool:
+    return "track name" in lower_to_real and "artist name" in lower_to_real
+
+
+def parse_tracks_from_playlist_csv(csv_path: Path) -> list[tuple[str, str, str]]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Playlist export file not found: {csv_path}")
+
+    tracks: list[tuple[str, str, str]] = []
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return tracks
+
+        lower_to_real = {field.strip().lower(): field for field in reader.fieldnames}
+        if not (_is_exportify_header(lower_to_real) or _is_tunemymusic_header(lower_to_real)):
+            raise RuntimeError(
+                "Unsupported CSV format. Expected Exportify or TuneMyMusic columns (Track name + Artist name)."
+            )
+
+        for row in reader:
+            track_name = _csv_field(row, lower_to_real, ["Track name", "Track Name"])
+            artist_name_raw = _csv_field(row, lower_to_real, ["Artist name", "Artist Name(s)"])
+            spotify_id = _csv_field(row, lower_to_real, ["Spotify - id"]) 
+
+            if not spotify_id:
+                track_uri = _csv_field(row, lower_to_real, ["Track URI"])
+                if track_uri.startswith("spotify:track:"):
+                    spotify_id = track_uri.rsplit(":", 1)[-1]
+
+            if not track_name:
+                continue
+
+            artist_name = _first_artist_name(artist_name_raw)
+            tracks.append((track_name, artist_name, spotify_id))
+
+    return tracks
+
+
+def _csv_track_cache_key(track_name: str, artist_name: str, spotify_id: str) -> str:
+    if spotify_id:
+        return spotify_id
+
+    digest = hashlib.sha1(f"{track_name.lower()}|{artist_name.lower()}".encode("utf-8")).hexdigest()
+    return f"csv-{digest[:20]}"
+
+
+def prefetch_csv_lyrics(
+    csv_paths: list[Path],
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> tuple[int, int, int]:
+    unique_tracks: dict[str, tuple[str, str]] = {}
+
+    for csv_path in csv_paths:
+        parsed_tracks = parse_tracks_from_playlist_csv(csv_path)
+        for track_name, artist_name, spotify_id in parsed_tracks:
+            cache_key = _csv_track_cache_key(track_name, artist_name, spotify_id)
+            if cache_key not in unique_tracks:
+                unique_tracks[cache_key] = (track_name, artist_name)
+
+    with_lyrics = 0
+    with_profanity = 0
+
+    for cache_key, (track_name, artist_name) in unique_tracks.items():
+        data = get_track_lyrics_data(
+            track_id=cache_key,
+            track_name=track_name,
+            artist_name=artist_name,
+            profanity_pattern=profanity_pattern,
+            cache_dir=cache_dir,
+        )
+        with_lyrics += 1
+        if data.profanity_timestamps_ms:
+            with_profanity += 1
+
+    return len(unique_tracks), with_lyrics, with_profanity
+
+
+def run_csv_prefetch_job(
+    csv_paths: list[Path],
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> None:
+    try:
+        total_tracks, with_lyrics, with_profanity = prefetch_csv_lyrics(
+            csv_paths=csv_paths,
+            profanity_pattern=profanity_pattern,
+            cache_dir=cache_dir,
+        )
+        print(
+            "[lyrics] csv-prefetch "
+            f"tracks={total_tracks} "
+            f"cached={with_lyrics} "
+            f"tracks_with_profanity={with_profanity}",
+            flush=True,
+        )
+    except (requests.RequestException, RuntimeError, OSError, ValueError) as exc:
+        print(f"[lyrics] csv-prefetch warning: {exc}", flush=True)
+
+
+def start_csv_prefetch_in_background(
+    csv_paths: list[Path],
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> threading.Thread:
+    worker = threading.Thread(
+        target=run_csv_prefetch_job,
+        args=(csv_paths, profanity_pattern, cache_dir),
+        name="lyrics-csv-prefetch",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def line_match_score(transcript_normalized: str, transcript_tokens: set[str], line: LyricLine) -> float:
+    if not transcript_tokens or not line.token_set:
+        return 0.0
+
+    overlap = transcript_tokens & line.token_set
+    if not overlap:
+        return 0.0
+
+    overlap_ratio = len(overlap) / max(1, len(transcript_tokens))
+    coverage_ratio = len(overlap) / max(1, len(line.token_set))
+
+    phrase_bonus = 0.0
+    if transcript_normalized and transcript_normalized in line.normalized:
+        phrase_bonus = 0.25
+    elif line.normalized and line.normalized in transcript_normalized:
+        phrase_bonus = 0.15
+
+    return overlap_ratio * 0.65 + coverage_ratio * 0.35 + phrase_bonus
+
+
+def align_transcript_to_line(
+    transcript: str,
+    lyrics_lines: list[LyricLine],
+    current_line_index: int,
+    min_score: float,
+) -> tuple[int, int, float] | None:
+    transcript_normalized = normalize_lyric_text(transcript)
+    transcript_tokens = tokenize_lyric_text(transcript_normalized)
+    if not transcript_tokens or not lyrics_lines:
+        return None
+
+    if current_line_index >= 0:
+        start = max(0, current_line_index - 8)
+        end = min(len(lyrics_lines), current_line_index + 22)
+        candidate_indices = range(start, end)
+    else:
+        candidate_indices = range(len(lyrics_lines))
+
+    best_score = 0.0
+    best_index = -1
+    for index in candidate_indices:
+        score = line_match_score(transcript_normalized, transcript_tokens, lyrics_lines[index])
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    if best_index < 0 or best_score < min_score:
+        return None
+
+    return best_index, lyrics_lines[best_index].timestamp_ms, best_score
+
+
+def load_cached_lyrics_library(
+    cache_dir: Path,
+    profanity_pattern: re.Pattern[str],
+) -> list[LyricsLibraryTrack]:
+    if not cache_dir.exists():
+        return []
+
+    library: list[LyricsLibraryTrack] = []
+    for cache_file in cache_dir.glob("*.json"):
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        track_id = str(payload.get("track_id") or cache_file.stem)
+        track_name = str(payload.get("track_name") or track_id)
+        artist_name = str(payload.get("artist_name") or "")
+        lyrics_lines = _parse_cached_lyrics_lines(payload.get("lyrics_lines"), profanity_pattern)
+        if not lyrics_lines:
+            continue
+
+        profanity_timestamps_ms = extract_profanity_timestamps_ms(lyrics_lines)
+        library.append(
+            LyricsLibraryTrack(
+                track_id=track_id,
+                track_name=track_name,
+                artist_name=artist_name,
+                profanity_timestamps_ms=profanity_timestamps_ms,
+                lyrics_lines=lyrics_lines,
+            )
+        )
+
+    return library
+
+
+def identify_track_from_transcript(
+    transcript: str,
+    library: list[LyricsLibraryTrack],
+) -> tuple[LyricsLibraryTrack, int, int, float] | None:
+    transcript_normalized = normalize_lyric_text(transcript)
+    transcript_tokens = tokenize_lyric_text(transcript_normalized)
+    if not transcript_tokens or not library:
+        return None
+
+    best: tuple[LyricsLibraryTrack, int, int, float] | None = None
+    second_best_score = 0.0
+
+    for track in library:
+        best_index = -1
+        best_score = 0.0
+        for index, line in enumerate(track.lyrics_lines):
+            score = line_match_score(transcript_normalized, transcript_tokens, line)
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        if best_index < 0:
+            continue
+
+        candidate = (track, best_index, track.lyrics_lines[best_index].timestamp_ms, best_score)
+        if best is None:
+            best = candidate
+            continue
+
+        if best_score > best[3]:
+            second_best_score = max(second_best_score, best[3])
+            best = candidate
+        else:
+            second_best_score = max(second_best_score, best_score)
+
+    if best is None:
+        return None
+
+    if best[3] < 0.72:
+        return None
+
+    if second_best_score > 0 and (best[3] - second_best_score) < 0.10:
+        return None
+
+    return best
+
+
+def maybe_duck_from_lyrics(
+    controller: SpotifyVolumeController,
+    state: LyricsMonitorState,
+    spotify_token: str,
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+    duck_percent: float,
+    hold_seconds: float,
+    preduck_ms: int,
+    poll_seconds: float,
+    transcript: str,
+) -> None:
+    transcript = transcript.strip().lower()
+
+    now = time.time()
+    if spotify_token and (now - state.last_poll_time >= poll_seconds):
+        state.last_poll_time = now
+        current = get_current_spotify_track(spotify_token)
+        if current and current.get("is_playing"):
+            track_id = str(current["track_id"])
+            track_name = str(current["track_name"])
+            artist_name = str(current["artist_name"])
+            state.current_progress_ms = int(current["progress_ms"])
+
+            if state.current_track_id != track_id:
+                data = get_track_lyrics_data(
+                    track_id=track_id,
+                    track_name=track_name,
+                    artist_name=artist_name,
+                    profanity_pattern=profanity_pattern,
+                    cache_dir=cache_dir,
+                )
+                state.current_track_id = track_id
+                state.current_track_name = f"{track_name} - {artist_name}"
+                state.profanity_timestamps_ms = data.profanity_timestamps_ms
+                state.lyrics_lines = data.lyrics_lines
+                state.triggered_timestamps_ms.clear()
+                state.current_line_index = -1
+                state.last_alignment_ms = -1
+                state.no_match_chunks = 0
+                print(
+                    f"[lyrics] track={state.current_track_name} profane-lines={len(state.profanity_timestamps_ms)}",
+                    flush=True,
+                )
+
+    if not state.current_track_id:
+        if not state.lyrics_library:
+            state.lyrics_library = load_cached_lyrics_library(cache_dir, profanity_pattern)
+
+        identified = identify_track_from_transcript(transcript, state.lyrics_library) if transcript else None
+        if identified is not None:
+            track, line_index, aligned_ms, score = identified
+            state.current_track_id = track.track_id
+            state.current_track_name = f"{track.track_name} - {track.artist_name}".strip(" -")
+            state.profanity_timestamps_ms = track.profanity_timestamps_ms
+            state.lyrics_lines = track.lyrics_lines
+            state.triggered_timestamps_ms.clear()
+            state.current_line_index = line_index
+            state.current_progress_ms = aligned_ms
+            state.last_alignment_ms = aligned_ms
+            state.no_match_chunks = 0
+            print(
+                f"[lyrics] identified track={state.current_track_name} at~{aligned_ms / 1000.0:.2f}s score={score:.2f}",
+                flush=True,
+            )
+        else:
+            return
+
+    alignment = None
+    if transcript:
+        alignment = align_transcript_to_line(
+            transcript=transcript,
+            lyrics_lines=state.lyrics_lines,
+            current_line_index=state.current_line_index,
+            min_score=0.50,
+        )
+    if alignment is not None:
+        line_index, aligned_ms, _score = alignment
+        state.current_line_index = line_index
+        state.last_alignment_ms = aligned_ms
+        state.no_match_chunks = 0
+
+        # Use transcript alignment to keep timing accurate if API progress drifts.
+        if state.current_progress_ms < 0 or abs(state.current_progress_ms - aligned_ms) > 2500:
+            state.current_progress_ms = aligned_ms
+    else:
+        state.no_match_chunks += 1
+        if not spotify_token and state.no_match_chunks >= 12:
+            # Force re-identification when we repeatedly fail matching in tokenless mode.
+            state.current_track_id = ""
+            state.current_track_name = ""
+            state.profanity_timestamps_ms = []
+            state.lyrics_lines = []
+            state.current_line_index = -1
+            state.current_progress_ms = -1
+            state.last_alignment_ms = -1
+            state.triggered_timestamps_ms.clear()
+            state.no_match_chunks = 0
+            return
+
+    progress_ms = state.current_progress_ms
+    if state.last_alignment_ms >= 0 and (progress_ms < 0 or abs(progress_ms - state.last_alignment_ms) > 4000):
+        progress_ms = state.last_alignment_ms
+
+    if progress_ms < 0:
+        return
+
+    horizon_ms = progress_ms + preduck_ms
+    for timestamp_ms in state.profanity_timestamps_ms:
+        if timestamp_ms in state.triggered_timestamps_ms:
+            continue
+        if (progress_ms - 250) <= timestamp_ms <= horizon_ms:
+            controller.duck(duck_percent, hold_seconds)
+            state.triggered_timestamps_ms.add(timestamp_ms)
+            print(
+                "[ducked-lyrics] "
+                f"track={state.current_track_name} "
+                f"at={timestamp_ms / 1000.0:.2f}s "
+                f"progress={progress_ms / 1000.0:.2f}s "
+                f"line-index={state.current_line_index}",
+                flush=True,
+            )
+            break
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Duck Spotify volume when profanity is detected in currently playing audio."
@@ -188,14 +996,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-rms",
         type=float,
-        default=0.01,
+        default=0.002,
         help="Skip transcription for very quiet chunks below this RMS level.",
     )
     parser.add_argument(
         "--model-size",
         type=str,
         default="base.en",
-        choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en"],
+        choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en"],
         help="faster-whisper model size.",
     )
     parser.add_argument("--language", type=str, default="en", help="Whisper language code.")
@@ -205,17 +1013,185 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional text file (one word per line) to extend the profanity list.",
     )
+    parser.add_argument(
+        "--input-source",
+        type=str,
+        default="loopback",
+        choices=["loopback", "microphone"],
+        help="Audio capture source: speaker loopback or physical microphone.",
+    )
+    parser.add_argument(
+        "--input-device",
+        type=str,
+        default="",
+        help="Optional partial device name for capture source selection.",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print available speakers/microphones and exit.",
+    )
+    parser.add_argument(
+        "--log-transcript",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print recognized transcript for each non-empty chunk (use --no-log-transcript to disable).",
+    )
+    parser.add_argument(
+        "--lyrics-mode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use synced lyrics plus Spotify playback progress to pre-duck before profane lines.",
+    )
+    parser.add_argument(
+        "--spotify-token",
+        type=str,
+        default="",
+        help="Spotify Web API access token. If omitted, uses SPOTIFY_ACCESS_TOKEN env var.",
+    )
+    parser.add_argument(
+        "--playlist-id",
+        type=str,
+        default="",
+        help="Optional playlist ID for lyrics prefetch.",
+    )
+    parser.add_argument(
+        "--prefetch-playlist-lyrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-cache lyrics for all tracks in --playlist-id.",
+    )
+    parser.add_argument(
+        "--lyrics-preduck-seconds",
+        type=float,
+        default=0.8,
+        help="How early to duck before a profane lyric timestamp.",
+    )
+    parser.add_argument(
+        "--lyrics-poll-seconds",
+        type=float,
+        default=1.0,
+        help="Polling interval for Spotify currently-playing endpoint when lyrics mode is enabled.",
+    )
+    parser.add_argument(
+        "--lyrics-cache-dir",
+        type=Path,
+        default=Path(".lyrics_cache"),
+        help="Directory to cache fetched lyrics metadata.",
+    )
+    parser.add_argument(
+        "--import-playlist-csv",
+        type=Path,
+        action="append",
+        default=[],
+        help="Path to TuneMyMusic/Exportify playlist CSV. Repeat flag to import multiple files.",
+    )
+    parser.add_argument(
+        "--prefetch-csv-lyrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fetch and cache lyrics from tracks listed in --import-playlist-csv files.",
+    )
+    parser.add_argument(
+        "--prefetch-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Exit after prefetch jobs (CSV/API) instead of starting live audio monitor.",
+    )
     return parser.parse_args()
 
 
-def find_loopback_mic():
-    default_speaker = sc.default_speaker()
-    if default_speaker is None:
-        raise RuntimeError("No default speaker found on this machine.")
+def _normalize_name(value: str) -> str:
+    return value.strip().lower()
 
-    loopback = default_speaker.microphone(include_loopback=True)
+
+def _find_by_name(items: list[Any], target_name: str) -> Any | None:
+    target = _normalize_name(target_name)
+    if not target:
+        return None
+
+    for item in items:
+        item_name = _normalize_name(getattr(item, "name", ""))
+        if target in item_name:
+            return item
+
+    return None
+
+
+def list_capture_devices() -> None:
+    print("Available speakers:", flush=True)
+    for speaker in sc.all_speakers():
+        print(f"  - {speaker.name}", flush=True)
+
+    print("Available microphones:", flush=True)
+    for mic in sc.all_microphones(include_loopback=False):
+        print(f"  - {mic.name}", flush=True)
+
+    print("Available loopback microphones:", flush=True)
+    for mic in sc.all_microphones(include_loopback=True):
+        if getattr(mic, "isloopback", False):
+            print(f"  - {mic.name}", flush=True)
+
+
+def find_microphone_input(preferred_name: str = ""):
+    microphones = list(sc.all_microphones(include_loopback=False))
+    selected = _find_by_name(microphones, preferred_name)
+    if selected is not None:
+        return selected
+
+    default_mic = sc.default_microphone()
+    if default_mic is not None:
+        return default_mic
+
+    raise RuntimeError("No microphone input found. Use --list-devices to inspect available devices.")
+
+
+def _loopback_from_speaker(speaker: Any):
+    if hasattr(speaker, "microphone"):
+        try:
+            return speaker.microphone(include_loopback=True)
+        except (AttributeError, OSError, RuntimeError):
+            return None
+
+    speaker_id = getattr(speaker, "id", None)
+    if speaker_id is None:
+        return None
+
+    try:
+        return sc.get_microphone(speaker_id, include_loopback=True)
+    except (OSError, RuntimeError):
+        return None
+
+
+def find_loopback_mic(preferred_name: str = ""):
+    speakers = list(sc.all_speakers())
+    selected_speaker = _find_by_name(speakers, preferred_name)
+    if selected_speaker is None:
+        selected_speaker = sc.default_speaker()
+
+    if selected_speaker is None:
+        raise RuntimeError("No speaker output found on this machine.")
+
+    loopback = _loopback_from_speaker(selected_speaker)
+
     if loopback is None:
-        raise RuntimeError("No loopback capture device found. Verify your Windows audio setup.")
+        loopback_mics = [mic for mic in sc.all_microphones(include_loopback=True) if getattr(mic, "isloopback", False)]
+        loopback = _find_by_name(loopback_mics, preferred_name)
+        if loopback is None:
+            speaker_name = _normalize_name(getattr(selected_speaker, "name", ""))
+            for mic in loopback_mics:
+                mic_name = _normalize_name(getattr(mic, "name", ""))
+                if speaker_name and speaker_name in mic_name:
+                    loopback = mic
+                    break
+
+        if loopback is None and loopback_mics:
+            loopback = loopback_mics[0]
+
+    if loopback is None:
+        raise RuntimeError(
+            "No loopback capture device found. Use --list-devices and optionally set --input-device."
+        )
 
     return loopback
 
@@ -224,6 +1200,16 @@ def main() -> int:
     args = parse_args()
     configure_huggingface_runtime()
 
+    if args.list_devices:
+        list_capture_devices()
+        return 0
+
+    csv_paths = [path for path in args.import_playlist_csv if str(path).strip()]
+    csv_prefetch_enabled = bool(args.prefetch_csv_lyrics or csv_paths)
+
+    if csv_prefetch_enabled and not csv_paths:
+        raise RuntimeError("--prefetch-csv-lyrics requires at least one --import-playlist-csv file.")
+
     words = set(DEFAULT_BAD_WORDS)
     words.update(load_custom_words(args.profanity_file))
     if not words:
@@ -231,12 +1217,99 @@ def main() -> int:
 
     profanity_pattern = build_word_regex(words)
     controller = SpotifyVolumeController()
+    spotify_token = args.spotify_token.strip() or os.environ.get("SPOTIFY_ACCESS_TOKEN", "").strip()
+    lyrics_enabled = bool(args.lyrics_mode)
+    lyrics_state = LyricsMonitorState()
+
+    if lyrics_enabled:
+        if spotify_token:
+            print(
+                "[lyrics] enabled: pre-ducking from Spotify playback + synced lyrics is active.",
+                flush=True,
+            )
+        elif csv_prefetch_enabled:
+            print(
+                "[lyrics] tokenless mode: using playlist CSV imports + LRCLib cache.",
+                flush=True,
+            )
+        else:
+            print(
+                "[lyrics] enabled but Spotify token is missing. "
+                "Set SPOTIFY_ACCESS_TOKEN or pass --spotify-token.",
+                flush=True,
+            )
+
+    if csv_prefetch_enabled:
+        if args.prefetch_only:
+            run_csv_prefetch_job(
+                csv_paths=csv_paths,
+                profanity_pattern=profanity_pattern,
+                cache_dir=args.lyrics_cache_dir,
+            )
+        else:
+            start_csv_prefetch_in_background(
+                csv_paths=csv_paths,
+                profanity_pattern=profanity_pattern,
+                cache_dir=args.lyrics_cache_dir,
+            )
+            print(
+                "[lyrics] csv-prefetch started in background; monitoring continues immediately.",
+                flush=True,
+            )
+
+    if args.prefetch_playlist_lyrics:
+        playlist_id = args.playlist_id.strip()
+        if not spotify_token:
+            raise RuntimeError("Spotify token is required for playlist lyrics prefetch.")
+        if not playlist_id:
+            raise RuntimeError("--playlist-id is required when --prefetch-playlist-lyrics is enabled.")
+
+        total_tracks, profane_tracks = prefetch_playlist_lyrics(
+            token=spotify_token,
+            playlist_id=playlist_id,
+            profanity_pattern=profanity_pattern,
+            cache_dir=args.lyrics_cache_dir,
+        )
+        print(
+            f"[lyrics] prefetched playlist tracks={total_tracks} tracks_with_profanity={profane_tracks}",
+            flush=True,
+        )
+
+    if args.prefetch_only:
+        return 0
+
+    if lyrics_enabled and not spotify_token:
+        lyrics_state.lyrics_library = load_cached_lyrics_library(args.lyrics_cache_dir, profanity_pattern)
+        if lyrics_state.lyrics_library:
+            print(
+                "[lyrics] Spotify API unavailable; using transcript-to-lyrics alignment from local cache.",
+                flush=True,
+            )
+        elif csv_prefetch_enabled:
+            print(
+                "[lyrics] waiting for background CSV lyrics cache; transcript ducking stays active meanwhile.",
+                flush=True,
+            )
+        else:
+            print(
+                "[lyrics] Spotify token missing and no cached synced lyrics found. "
+                "Run with --prefetch-csv-lyrics + --import-playlist-csv first.",
+                flush=True,
+            )
+            lyrics_enabled = False
+
+    preduck_ms = max(0, int(args.lyrics_preduck_seconds * 1000))
 
     print(f"Loading Whisper model: {args.model_size}", flush=True)
     model = WhisperModel(args.model_size, device="cpu", compute_type="int8")
 
-    print("Using default speaker loopback as input.", flush=True)
-    loopback_mic = find_loopback_mic()
+    input_name = args.input_device.strip()
+    if args.input_source == "microphone":
+        capture_device = find_microphone_input(input_name)
+        print(f"Using microphone input: {capture_device.name}", flush=True)
+    else:
+        capture_device = find_loopback_mic(input_name)
+        print(f"Using loopback input: {capture_device.name}", flush=True)
 
     running = True
 
@@ -257,9 +1330,11 @@ def main() -> int:
     if chunk_frames <= 0:
         raise ValueError("chunk-seconds and sample-rate produce invalid frame count.")
 
+    low_rms_counter = 0
+
     try:
         while running:
-            captured = loopback_mic.record(
+            captured = capture_device.record(
                 numframes=chunk_frames,
                 samplerate=args.sample_rate,
                 channels=1,
@@ -269,12 +1344,47 @@ def main() -> int:
 
             controller.restore_if_due()
 
-            if rms_level(chunk) < args.min_rms:
+            current_rms = rms_level(chunk)
+            if current_rms < args.min_rms:
+                low_rms_counter += 1
+                if low_rms_counter % 25 == 0:
+                    print(
+                        "[input] very low audio level "
+                        f"(rms={current_rms:.5f}, min-rms={args.min_rms:.5f}). "
+                        "Try --input-device or lower --min-rms.",
+                        flush=True,
+                    )
                 continue
 
+            low_rms_counter = 0
+
             transcript = transcribe_chunk(model, chunk, args.language).lower()
+
+            if lyrics_enabled:
+                try:
+                    maybe_duck_from_lyrics(
+                        controller=controller,
+                        state=lyrics_state,
+                        spotify_token=spotify_token,
+                        profanity_pattern=profanity_pattern,
+                        cache_dir=args.lyrics_cache_dir,
+                        duck_percent=args.duck_percent,
+                        hold_seconds=args.hold_seconds,
+                        preduck_ms=preduck_ms,
+                        poll_seconds=max(0.2, args.lyrics_poll_seconds),
+                        transcript=transcript,
+                    )
+                except (requests.RequestException, RuntimeError, OSError) as exc:
+                    message = str(exc)
+                    if message != lyrics_state.last_error:
+                        print(f"[lyrics] warning: {message}", flush=True)
+                        lyrics_state.last_error = message
+
             if not transcript:
                 continue
+
+            if args.log_transcript:
+                print(f"[heard] {transcript}", flush=True)
 
             matches = sorted(set(match.group(0).lower() for match in profanity_pattern.finditer(transcript)))
             if not matches:

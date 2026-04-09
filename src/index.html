@@ -51,18 +51,19 @@
             Min RMS
             <span class="help-dot" tabindex="0" data-tip="Ignore very quiet audio below this loudness threshold.">?</span>
           </span>
-          <input id="minRms" type="number" min="0" max="1" step="0.001" value="0.01" />
+          <input id="minRms" type="number" min="0" max="1" step="0.0005" value="0.002" />
         </label>
 
         <label>
           <span class="label-title">
             Whisper model
-            <span class="help-dot" tabindex="0" data-tip="Speech model size. tiny/base are faster; small is usually more accurate.">?</span>
+            <span class="help-dot" tabindex="0" data-tip="Speech model size. small/medium are more accurate but slower than tiny/base.">?</span>
           </span>
           <select id="modelSize">
             <option>tiny.en</option>
-            <option selected>base.en</option>
-            <option>small.en</option>
+            <option>base.en</option>
+            <option selected>small.en</option>
+            <option>medium.en</option>
           </select>
         </label>
 
@@ -74,12 +75,104 @@
           <input id="language" type="text" value="en" />
         </label>
 
+        <label>
+          <span class="label-title">
+            Input source
+            <span class="help-dot" tabindex="0" data-tip="Use loopback to capture speaker output (recommended for Spotify), or microphone for room/voice input.">?</span>
+          </span>
+          <select id="inputSource">
+            <option value="loopback" selected>loopback</option>
+            <option value="microphone">microphone</option>
+          </select>
+        </label>
+
+        <label>
+          <span class="label-title">
+            Input device (optional)
+            <span class="help-dot" tabindex="0" data-tip="Partial device name to force a specific source, e.g. Headset Earphone or Living Room speaker.">?</span>
+          </span>
+          <input id="inputDevice" type="text" placeholder="Headset Earphone" />
+        </label>
+
         <label class="wide">
           <span class="label-title">
             Custom profanity file (optional)
             <span class="help-dot" tabindex="0" data-tip="Optional path to a text file with one profanity word per line.">?</span>
           </span>
           <input id="profanityFile" type="text" placeholder="C:/path/to/words.txt" />
+        </label>
+
+        <label class="wide">
+          <span class="label-title">
+            <span>Lyrics predictive ducking (Spotify token mode)</span>
+            <span class="help-dot" tabindex="0" data-tip="Optional advanced mode. Uses Spotify playback progress + synced lyrics to duck before a profane line starts.">?</span>
+          </span>
+          <input id="lyricsMode" type="checkbox" />
+        </label>
+
+        <div class="wide guidance-box">
+          <p>
+            No Spotify token needed for CSV workflow. Export playlists as CSV and CleanFade will fetch lyrics from LRCLib.
+          </p>
+          <p>
+            For Spotify: use Exportify CSV. For Apple Music/YouTube/other platforms: use TuneMyMusic CSV.
+          </p>
+        </div>
+
+        <label class="wide">
+          <span class="label-title">
+            Playlist CSV paths
+            <span class="help-dot" tabindex="0" data-tip="Paste one or more CSV file paths (one per line). Supports Exportify and TuneMyMusic formats.">?</span>
+          </span>
+          <textarea id="playlistCsvPaths" rows="3" placeholder="C:/path/Exportify.csv&#10;C:/path/TuneMyMusic.csv"></textarea>
+        </label>
+
+        <label>
+          <span class="label-title">
+            Prefetch CSV lyrics
+            <span class="help-dot" tabindex="0" data-tip="Loads tracks from CSV and caches lyrics from LRCLib before monitoring.">?</span>
+          </span>
+          <input id="prefetchCsvLyrics" type="checkbox" checked />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Prefetch only
+            <span class="help-dot" tabindex="0" data-tip="Only build lyrics cache from CSV/API and exit without starting monitor.">?</span>
+          </span>
+          <input id="prefetchOnly" type="checkbox" />
+        </label>
+
+        <label class="wide">
+          <span class="label-title">
+            Spotify access token (optional)
+            <span class="help-dot" tabindex="0" data-tip="Only needed for Spotify API features like currently-playing pre-duck and playlist API prefetch.">?</span>
+          </span>
+          <input id="spotifyToken" type="password" placeholder="BQ..." />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Playlist ID (optional)
+            <span class="help-dot" tabindex="0" data-tip="Used with prefetch to cache lyrics for all tracks in a playlist.">?</span>
+          </span>
+          <input id="playlistId" type="text" placeholder="37i9dQZF..." />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Prefetch playlist lyrics
+            <span class="help-dot" tabindex="0" data-tip="When enabled, the monitor preloads lyrics cache for the playlist ID at start.">?</span>
+          </span>
+          <input id="prefetchPlaylistLyrics" type="checkbox" />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Lyrics preduck seconds
+            <span class="help-dot" tabindex="0" data-tip="How early to duck before profane lyric timestamps.">?</span>
+          </span>
+          <input id="lyricsPreduckSeconds" type="number" min="0" max="5" step="0.1" value="0.8" />
         </label>
       </section>
 

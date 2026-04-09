@@ -94,6 +94,21 @@ python spotify_duck.py --duck-percent 50 --hold-seconds 3 --model-size tiny.en
 - `--chunk-seconds`: chunk duration in seconds
 - `--profanity-file`: optional custom words file (one word per line)
 
+## Tokenless Lyrics Workflow (CSV + LRCLib)
+
+CleanFade supports a tokenless lyrics-cache workflow using third-party lyrics data from LRCLib and playlist exports.
+
+- Spotify users: export playlist CSV with Exportify.
+- Other platforms (Apple Music, YouTube Music, etc.): export playlist CSV with TuneMyMusic.
+
+Then run:
+
+```powershell
+python spotify_duck.py --prefetch-only --import-playlist-csv Exportify.csv --import-playlist-csv TuneMyMusic.csv
+```
+
+This pre-caches lyrics metadata without Spotify API tokens. During live monitoring, CleanFade still uses audio transcription for ducking.
+
 ## Notes and limitations
 
 - Detection is near real-time, not frame-perfect.
