@@ -40,6 +40,17 @@ DEFAULT_BAD_WORDS = {
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9']+")
+VAD_ASSET_NAME = "silero_encoder_v5.onnx"
+
+_VAD_FILTER_ENABLED = True
+_VAD_FILTER_LOCK = threading.Lock()
+
+
+def _is_missing_vad_asset_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return VAD_ASSET_NAME.lower() in message or (
+        "no_suchfile" in message and "faster_whisper" in message and "assets" in message
+    )
 
 
 def configure_huggingface_runtime() -> None:
@@ -95,6 +106,7 @@ class DuckState:
 class LyricsMonitorState:
     current_track_id: str = ""
     current_track_name: str = ""
+    spotify_track_id: str = ""
     profanity_timestamps_ms: list[int] = field(default_factory=list)
     lyrics_lines: list["LyricLine"] = field(default_factory=list)
     triggered_timestamps_ms: set[int] = field(default_factory=set)
@@ -107,6 +119,10 @@ class LyricsMonitorState:
     transcript_history: list[str] = field(default_factory=list)
     last_poll_time: float = 0.0
     last_error: str = ""
+    lyrics_fetch_request_id: int = 0
+    lyrics_fetch_inflight_track_id: str = ""
+    lyrics_fetch_result: "PendingLyricsFetchResult | None" = None
+    lyrics_fetch_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 @dataclass
@@ -132,6 +148,16 @@ class LyricsLibraryTrack:
     profanity_timestamps_ms: list[int]
     lyrics_lines: list[LyricLine]
     token_union: set[str] = field(default_factory=set)
+
+
+@dataclass
+class PendingLyricsFetchResult:
+    request_id: int
+    track_id: str
+    track_name: str
+    artist_name: str
+    data: TrackLyricsData | None = None
+    error: str = ""
 
 
 class SpotifyVolumeController:
@@ -206,15 +232,43 @@ def transcribe_chunk(
     chunk: np.ndarray,
     language: str,
 ) -> str:
-    segments, _ = model.transcribe(
-        chunk,
-        language=language,
-        beam_size=1,
-        best_of=1,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        without_timestamps=True,
-    )
+    global _VAD_FILTER_ENABLED
+
+    with _VAD_FILTER_LOCK:
+        use_vad_filter = _VAD_FILTER_ENABLED
+
+    try:
+        segments, _ = model.transcribe(
+            chunk,
+            language=language,
+            beam_size=1,
+            best_of=1,
+            vad_filter=use_vad_filter,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+    except Exception as exc:
+        if not use_vad_filter or not _is_missing_vad_asset_error(exc):
+            raise
+
+        with _VAD_FILTER_LOCK:
+            if _VAD_FILTER_ENABLED:
+                _VAD_FILTER_ENABLED = False
+                print(
+                    "[transcribe] warning: missing faster-whisper VAD assets in sidecar; continuing with VAD disabled.",
+                    flush=True,
+                )
+
+        segments, _ = model.transcribe(
+            chunk,
+            language=language,
+            beam_size=1,
+            best_of=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+
     return " ".join(segment.text.strip() for segment in segments if segment.text).strip()
 
 
@@ -911,6 +965,107 @@ def identify_track_from_transcript(
     return best
 
 
+def _start_async_track_lyrics_fetch(
+    state: LyricsMonitorState,
+    track_id: str,
+    track_name: str,
+    artist_name: str,
+    profanity_pattern: re.Pattern[str],
+    cache_dir: Path,
+) -> None:
+    with state.lyrics_fetch_lock:
+        state.lyrics_fetch_request_id += 1
+        request_id = state.lyrics_fetch_request_id
+        state.lyrics_fetch_inflight_track_id = track_id
+        state.lyrics_fetch_result = None
+
+    print(
+        f"[lyrics] loading synced lyrics track={track_name} - {artist_name}",
+        flush=True,
+    )
+
+    def worker() -> None:
+        try:
+            data = get_track_lyrics_data(
+                track_id=track_id,
+                track_name=track_name,
+                artist_name=artist_name,
+                profanity_pattern=profanity_pattern,
+                cache_dir=cache_dir,
+            )
+            result = PendingLyricsFetchResult(
+                request_id=request_id,
+                track_id=track_id,
+                track_name=track_name,
+                artist_name=artist_name,
+                data=data,
+            )
+        except (requests.RequestException, RuntimeError, OSError, ValueError) as exc:
+            result = PendingLyricsFetchResult(
+                request_id=request_id,
+                track_id=track_id,
+                track_name=track_name,
+                artist_name=artist_name,
+                error=str(exc),
+            )
+
+        with state.lyrics_fetch_lock:
+            if request_id != state.lyrics_fetch_request_id:
+                return
+            state.lyrics_fetch_result = result
+            state.lyrics_fetch_inflight_track_id = ""
+
+    worker_thread = threading.Thread(
+        target=worker,
+        name="lyrics-track-fetch",
+        daemon=True,
+    )
+    worker_thread.start()
+
+
+def _consume_pending_track_lyrics_fetch(
+    state: LyricsMonitorState,
+) -> PendingLyricsFetchResult | None:
+    with state.lyrics_fetch_lock:
+        result = state.lyrics_fetch_result
+        state.lyrics_fetch_result = None
+    return result
+
+
+def _apply_pending_track_lyrics_fetch(state: LyricsMonitorState) -> None:
+    result = _consume_pending_track_lyrics_fetch(state)
+    if result is None:
+        return
+
+    if result.track_id != state.spotify_track_id:
+        return
+
+    if result.error:
+        if result.error != state.last_error:
+            print(f"[lyrics] warning: {result.error}", flush=True)
+            state.last_error = result.error
+        return
+
+    if result.data is None:
+        return
+
+    state.current_track_id = result.track_id
+    state.current_track_name = f"{result.track_name} - {result.artist_name}".strip(" -")
+    state.profanity_timestamps_ms = result.data.profanity_timestamps_ms
+    state.lyrics_lines = result.data.lyrics_lines
+    state.triggered_timestamps_ms.clear()
+    state.current_line_index = -1
+    state.last_alignment_ms = -1
+    state.no_match_chunks = 0
+    state.transcript_history.clear()
+    state.last_error = ""
+
+    print(
+        f"[lyrics] track={state.current_track_name} profane-lines={len(state.profanity_timestamps_ms)}",
+        flush=True,
+    )
+
+
 def maybe_duck_from_lyrics(
     controller: SpotifyVolumeController,
     state: LyricsMonitorState,
@@ -925,6 +1080,9 @@ def maybe_duck_from_lyrics(
 ) -> None:
     transcript = transcript.strip().lower()
 
+    if spotify_token:
+        _apply_pending_track_lyrics_fetch(state)
+
     now = time.time()
     if spotify_token and (now - state.last_poll_time >= poll_seconds):
         state.last_poll_time = now
@@ -935,29 +1093,30 @@ def maybe_duck_from_lyrics(
             artist_name = str(current["artist_name"])
             state.current_progress_ms = int(current["progress_ms"])
 
-            if state.current_track_id != track_id:
-                data = get_track_lyrics_data(
+            if state.spotify_track_id != track_id:
+                state.spotify_track_id = track_id
+                state.current_track_id = ""
+                state.current_track_name = f"{track_name} - {artist_name}"
+                state.profanity_timestamps_ms = []
+                state.lyrics_lines = []
+                state.triggered_timestamps_ms.clear()
+                state.current_line_index = -1
+                state.last_alignment_ms = -1
+                state.no_match_chunks = 0
+                state.transcript_history.clear()
+                _start_async_track_lyrics_fetch(
+                    state=state,
                     track_id=track_id,
                     track_name=track_name,
                     artist_name=artist_name,
                     profanity_pattern=profanity_pattern,
                     cache_dir=cache_dir,
                 )
-                state.current_track_id = track_id
-                state.current_track_name = f"{track_name} - {artist_name}"
-                state.profanity_timestamps_ms = data.profanity_timestamps_ms
-                state.lyrics_lines = data.lyrics_lines
-                state.triggered_timestamps_ms.clear()
-                state.current_line_index = -1
-                state.last_alignment_ms = -1
-                state.no_match_chunks = 0
-                state.transcript_history.clear()
-                print(
-                    f"[lyrics] track={state.current_track_name} profane-lines={len(state.profanity_timestamps_ms)}",
-                    flush=True,
-                )
 
     if not state.current_track_id:
+        if spotify_token:
+            return
+
         if not state.lyrics_library:
             state.lyrics_library = load_cached_lyrics_library(
                 cache_dir,
@@ -1441,6 +1600,9 @@ def main() -> int:
 
             transcript = transcribe_chunk(model, chunk, args.language).lower()
 
+            if transcript and args.log_transcript:
+                print(f"[heard] {transcript}", flush=True)
+
             if lyrics_enabled:
                 try:
                     maybe_duck_from_lyrics(
@@ -1463,9 +1625,6 @@ def main() -> int:
 
             if not transcript:
                 continue
-
-            if args.log_transcript:
-                print(f"[heard] {transcript}", flush=True)
 
             matches = sorted(set(match.group(0).lower() for match in profanity_pattern.finditer(transcript)))
             if not matches:

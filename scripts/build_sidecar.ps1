@@ -58,7 +58,21 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 New-Item -ItemType Directory -Force -Path $workPath | Out-Null
 New-Item -ItemType Directory -Force -Path $specPath | Out-Null
 
-& $condaExe run -n $condaEnvName python -m PyInstaller --noconfirm --clean --onefile --noconsole --name cleanfade-engine --distpath $binDir --workpath $workPath --specpath $specPath $pythonScript
+$pyInstallerArgs = @(
+    "--noconfirm",
+    "--clean",
+    "--onefile",
+    "--noconsole",
+    "--collect-data", "faster_whisper",
+    "--collect-submodules", "faster_whisper",
+    "--name", "cleanfade-engine",
+    "--distpath", $binDir,
+    "--workpath", $workPath,
+    "--specpath", $specPath,
+    $pythonScript
+)
+
+& $condaExe run -n $condaEnvName python -m PyInstaller @pyInstallerArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed to build cleanfade-engine."
