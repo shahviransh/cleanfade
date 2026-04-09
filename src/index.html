@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CleanFade</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">Desktop profanity guard</p>
+        <h1>CleanFade</h1>
+        <p class="subtext">Reduce Spotify volume whenever curse words are detected.</p>
+      </header>
+
+      <section class="grid">
+        <label>
+          <span class="label-title">
+            Duck percent
+            <span class="help-dot" tabindex="0" data-tip="How much to lower Spotify volume when profanity is detected.">?</span>
+          </span>
+          <input id="duckPercent" type="number" min="0" max="100" step="1" value="45" />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Hold seconds
+            <span class="help-dot" tabindex="0" data-tip="How long volume stays reduced after the last detected profanity.">?</span>
+          </span>
+          <input id="holdSeconds" type="number" min="0.5" max="10" step="0.1" value="2.5" />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Chunk seconds
+            <span class="help-dot" tabindex="0" data-tip="Audio chunk length for transcription. Lower values react faster, higher values can be more stable.">?</span>
+          </span>
+          <input id="chunkSeconds" type="number" min="0.5" max="5" step="0.1" value="2.0" />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Min RMS
+            <span class="help-dot" tabindex="0" data-tip="Ignore very quiet audio below this loudness threshold.">?</span>
+          </span>
+          <input id="minRms" type="number" min="0" max="1" step="0.001" value="0.01" />
+        </label>
+
+        <label>
+          <span class="label-title">
+            Whisper model
+            <span class="help-dot" tabindex="0" data-tip="Speech model size. tiny/base are faster; small is usually more accurate.">?</span>
+          </span>
+          <select id="modelSize">
+            <option>tiny.en</option>
+            <option selected>base.en</option>
+            <option>small.en</option>
+          </select>
+        </label>
+
+        <label>
+          <span class="label-title">
+            Language code
+            <span class="help-dot" tabindex="0" data-tip="Language passed to transcription, for example en, es, or fr.">?</span>
+          </span>
+          <input id="language" type="text" value="en" />
+        </label>
+
+        <label class="wide">
+          <span class="label-title">
+            Custom profanity file (optional)
+            <span class="help-dot" tabindex="0" data-tip="Optional path to a text file with one profanity word per line.">?</span>
+          </span>
+          <input id="profanityFile" type="text" placeholder="C:/path/to/words.txt" />
+        </label>
+      </section>
+
+      <section class="actions">
+        <button id="startBtn" class="cta">Start Monitor</button>
+        <button id="stopBtn" class="secondary" disabled>Stop Monitor</button>
+      </section>
+
+      <section class="console-wrap">
+        <h2>Live log</h2>
+        <pre id="logBox" class="console"></pre>
+      </section>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

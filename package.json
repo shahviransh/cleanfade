@@ -1,0 +1,15 @@
+{
+  "name": "cleanfade",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "build:sidecar": "powershell -ExecutionPolicy Bypass -File ./scripts/build_sidecar.ps1",
+    "tauri:dev": "npm run build:sidecar && tauri dev",
+    "tauri:build": "npm run build:sidecar && tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
