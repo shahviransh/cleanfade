@@ -27,6 +27,11 @@ const setRunning = (running) => {
   stopBtn.disabled = !running;
 };
 
+const isWarningText = (text) => {
+  const normalized = String(text).toLowerCase();
+  return normalized.includes("warning") || normalized.includes("userwarning");
+};
+
 const boot = async () => {
   const tauri = window.__TAURI__;
 
@@ -41,7 +46,15 @@ const boot = async () => {
   const { listen } = tauri.event;
 
   await listen("engine-log", (event) => appendLog(String(event.payload)));
-  await listen("engine-error", (event) => appendLog(`ERROR: ${String(event.payload)}`));
+  await listen("engine-error", (event) => {
+    const line = String(event.payload);
+    if (isWarningText(line)) {
+      appendLog(`WARN: ${line}`);
+      return;
+    }
+
+    appendLog(`ERROR: ${line}`);
+  });
   await listen("engine-stopped", (event) => {
     appendLog(String(event.payload));
     setRunning(false);

@@ -1,57 +1,64 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$venvPath = Join-Path $repoRoot ".venv"
 $requirements = Join-Path $repoRoot "requirements.txt"
 $pythonScript = Join-Path $repoRoot "spotify_duck.py"
 $binDir = Join-Path $repoRoot "src-tauri\\bin"
 $buildRoot = Join-Path $repoRoot ".pybuild"
 $workPath = Join-Path $buildRoot "work"
 $specPath = Join-Path $buildRoot "spec"
-$usePy312 = $false
 
-if (Get-Command py -ErrorAction SilentlyContinue) {
-    try {
-        py -3.12 -c "import sys" *> $null
-        $usePy312 = $true
-    } catch {
-        $usePy312 = $false
+$condaCmd = Get-Command conda -ErrorAction SilentlyContinue
+if (-not $condaCmd) {
+    throw "Conda is required for sidecar packaging. Install Miniconda/Anaconda and ensure 'conda' is on PATH."
+}
+
+$condaExe = $condaCmd.Source
+$condaEnvName = if ([string]::IsNullOrWhiteSpace($env:CLEANFADE_CONDA_ENV)) { "cleanfade" } else { $env:CLEANFADE_CONDA_ENV }
+
+$envExists = $false
+try {
+    $envListJson = (& $condaExe env list --json | Out-String)
+    $envList = $envListJson | ConvertFrom-Json
+    if ($null -ne $envList.envs) {
+        foreach ($envPath in $envList.envs) {
+            if ((Split-Path $envPath -Leaf) -eq $condaEnvName) {
+                $envExists = $true
+                break
+            }
+        }
+    }
+} catch {
+    throw "Failed to inspect Conda environments. Verify Conda installation is healthy."
+}
+
+if (-not $envExists) {
+    & $condaExe create -y -n $condaEnvName python=3.12
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create Conda environment '$condaEnvName' with Python 3.12."
     }
 }
 
-if (-not (Test-Path $venvPath)) {
-    if ($usePy312) {
-        py -3.12 -m venv $venvPath
-    } else {
-        python -m venv $venvPath
-    }
-}
-
-$pythonExe = Join-Path $venvPath "Scripts\\python.exe"
-if (-not (Test-Path $pythonExe)) {
-    throw "Python virtual environment is missing."
-}
-
-$pythonVersion = (& $pythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
+$pythonVersion = (& $condaExe run -n $condaEnvName python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
 if ([version]$pythonVersion -ge [version]"3.13") {
-    if ($usePy312) {
-        Remove-Item $venvPath -Recurse -Force
-        py -3.12 -m venv $venvPath
-        $pythonExe = Join-Path $venvPath "Scripts\\python.exe"
-        $pythonVersion = (& $pythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
-    } else {
-        throw "Python $pythonVersion is not supported for sidecar packaging. Install Python 3.12 and run this script again."
-    }
+    throw "Conda environment '$condaEnvName' is using Python $pythonVersion. Use Python 3.12 for sidecar packaging."
 }
 
-& $pythonExe -m pip install --upgrade pip
-& $pythonExe -m pip install -r $requirements pyinstaller
+& $condaExe run -n $condaEnvName python -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to upgrade pip in Conda environment '$condaEnvName'."
+}
+
+& $condaExe run -n $condaEnvName python -m pip install -r $requirements pyinstaller
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install Python dependencies in Conda environment '$condaEnvName'."
+}
 
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 New-Item -ItemType Directory -Force -Path $workPath | Out-Null
 New-Item -ItemType Directory -Force -Path $specPath | Out-Null
 
-& $pythonExe -m PyInstaller --noconfirm --clean --onefile --noconsole --name cleanfade-engine --distpath $binDir --workpath $workPath --specpath $specPath $pythonScript
+& $condaExe run -n $condaEnvName python -m PyInstaller --noconfirm --clean --onefile --noconsole --name cleanfade-engine --distpath $binDir --workpath $workPath --specpath $specPath $pythonScript
 
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed to build cleanfade-engine."

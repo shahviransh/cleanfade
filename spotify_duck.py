@@ -1,16 +1,21 @@
 import argparse
+import logging
 import math
+import os
 import re
 import signal
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
+
+# Keep COM in MTA mode so pycaw/comtypes matches thread state set by other audio libs.
+sys.coinit_flags = 0
 
 import numpy as np
 import soundcard as sc
 from faster_whisper import WhisperModel
-from pycaw.pycaw import AudioUtilities
 
 
 DEFAULT_BAD_WORDS = {
@@ -27,6 +32,19 @@ DEFAULT_BAD_WORDS = {
     "motherfucker",
     "shit",
 }
+
+
+def configure_huggingface_runtime() -> None:
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`huggingface_hub` cache-system uses symlinks by default.*",
+        category=UserWarning,
+    )
+
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 
 def build_word_regex(words: set[str]) -> re.Pattern[str]:
@@ -67,10 +85,22 @@ class DuckState:
 
 class SpotifyVolumeController:
     def __init__(self) -> None:
+        try:
+            from pycaw.pycaw import AudioUtilities
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == -2147417850:
+                raise RuntimeError(
+                    "COM initialization conflict while loading pycaw. "
+                    "Please relaunch CleanFade and avoid starting it from a host process "
+                    "that forces STA COM mode."
+                ) from exc
+            raise
+
+        self._audio_utilities = AudioUtilities
         self._state = DuckState()
 
     def _spotify_simple_volume(self):
-        for session in AudioUtilities.GetAllSessions():
+        for session in self._audio_utilities.GetAllSessions():
             process = session.Process
             if process is None:
                 continue
@@ -192,6 +222,7 @@ def find_loopback_mic():
 
 def main() -> int:
     args = parse_args()
+    configure_huggingface_runtime()
 
     words = set(DEFAULT_BAD_WORDS)
     words.update(load_custom_words(args.profanity_file))

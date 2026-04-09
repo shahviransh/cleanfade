@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use serde::Deserialize;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
