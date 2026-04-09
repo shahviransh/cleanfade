@@ -103,6 +103,8 @@ class LyricsMonitorState:
     last_alignment_ms: int = -1
     no_match_chunks: int = 0
     lyrics_library: list["LyricsLibraryTrack"] = field(default_factory=list)
+    ordered_track_ids: list[str] = field(default_factory=list)
+    transcript_history: list[str] = field(default_factory=list)
     last_poll_time: float = 0.0
     last_error: str = ""
 
@@ -129,6 +131,7 @@ class LyricsLibraryTrack:
     artist_name: str
     profanity_timestamps_ms: list[int]
     lyrics_lines: list[LyricLine]
+    token_union: set[str] = field(default_factory=set)
 
 
 class SpotifyVolumeController:
@@ -647,6 +650,22 @@ def _csv_track_cache_key(track_name: str, artist_name: str, spotify_id: str) -> 
     return f"csv-{digest[:20]}"
 
 
+def ordered_track_keys_from_csv_paths(csv_paths: list[Path]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    for csv_path in csv_paths:
+        parsed_tracks = parse_tracks_from_playlist_csv(csv_path)
+        for track_name, artist_name, spotify_id in parsed_tracks:
+            cache_key = _csv_track_cache_key(track_name, artist_name, spotify_id)
+            if cache_key in seen:
+                continue
+            seen.add(cache_key)
+            ordered.append(cache_key)
+
+    return ordered
+
+
 def prefetch_csv_lyrics(
     csv_paths: list[Path],
     profanity_pattern: re.Pattern[str],
@@ -771,6 +790,7 @@ def align_transcript_to_line(
 def load_cached_lyrics_library(
     cache_dir: Path,
     profanity_pattern: re.Pattern[str],
+    preferred_track_ids: list[str] | None = None,
 ) -> list[LyricsLibraryTrack]:
     if not cache_dir.exists():
         return []
@@ -790,6 +810,10 @@ def load_cached_lyrics_library(
             continue
 
         profanity_timestamps_ms = extract_profanity_timestamps_ms(lyrics_lines)
+        token_union: set[str] = set()
+        for line in lyrics_lines:
+            token_union.update(line.token_set)
+
         library.append(
             LyricsLibraryTrack(
                 track_id=track_id,
@@ -797,8 +821,28 @@ def load_cached_lyrics_library(
                 artist_name=artist_name,
                 profanity_timestamps_ms=profanity_timestamps_ms,
                 lyrics_lines=lyrics_lines,
+                token_union=token_union,
             )
         )
+
+    if preferred_track_ids:
+        ordered: list[LyricsLibraryTrack] = []
+        seen_ids: set[str] = set()
+        by_id = {track.track_id: track for track in library}
+
+        for track_id in preferred_track_ids:
+            candidate = by_id.get(track_id)
+            if candidate is None or track_id in seen_ids:
+                continue
+            ordered.append(candidate)
+            seen_ids.add(track_id)
+
+        for candidate in library:
+            if candidate.track_id in seen_ids:
+                continue
+            ordered.append(candidate)
+
+        return ordered
 
     return library
 
@@ -809,13 +853,27 @@ def identify_track_from_transcript(
 ) -> tuple[LyricsLibraryTrack, int, int, float] | None:
     transcript_normalized = normalize_lyric_text(transcript)
     transcript_tokens = tokenize_lyric_text(transcript_normalized)
-    if not transcript_tokens or not library:
+    if len(transcript_tokens) < 2 or not library:
         return None
+
+    candidates: list[tuple[LyricsLibraryTrack, int]] = []
+    for track in library:
+        overlap_count = len(transcript_tokens & track.token_union)
+        if overlap_count <= 0:
+            continue
+        candidates.append((track, overlap_count))
+
+    if not candidates:
+        return None
+
+    # Keep stable order (which reflects user CSV priority), then prefer more token overlap.
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    candidates = candidates[:48]
 
     best: tuple[LyricsLibraryTrack, int, int, float] | None = None
     second_best_score = 0.0
 
-    for track in library:
+    for track, overlap_count in candidates:
         best_index = -1
         best_score = 0.0
         for index, line in enumerate(track.lyrics_lines):
@@ -827,24 +885,27 @@ def identify_track_from_transcript(
         if best_index < 0:
             continue
 
-        candidate = (track, best_index, track.lyrics_lines[best_index].timestamp_ms, best_score)
+        overlap_bonus = min(0.12, overlap_count / max(1, len(transcript_tokens)) * 0.20)
+        candidate_score = best_score + overlap_bonus
+        candidate = (track, best_index, track.lyrics_lines[best_index].timestamp_ms, candidate_score)
         if best is None:
             best = candidate
             continue
 
-        if best_score > best[3]:
+        if candidate_score > best[3]:
             second_best_score = max(second_best_score, best[3])
             best = candidate
         else:
-            second_best_score = max(second_best_score, best_score)
+            second_best_score = max(second_best_score, candidate_score)
 
     if best is None:
         return None
 
-    if best[3] < 0.72:
+    min_accept = 0.60 if len(transcript_tokens) >= 6 else 0.68
+    if best[3] < min_accept:
         return None
 
-    if second_best_score > 0 and (best[3] - second_best_score) < 0.10:
+    if second_best_score > 0 and (best[3] - second_best_score) < 0.07:
         return None
 
     return best
@@ -890,6 +951,7 @@ def maybe_duck_from_lyrics(
                 state.current_line_index = -1
                 state.last_alignment_ms = -1
                 state.no_match_chunks = 0
+                state.transcript_history.clear()
                 print(
                     f"[lyrics] track={state.current_track_name} profane-lines={len(state.profanity_timestamps_ms)}",
                     flush=True,
@@ -897,9 +959,19 @@ def maybe_duck_from_lyrics(
 
     if not state.current_track_id:
         if not state.lyrics_library:
-            state.lyrics_library = load_cached_lyrics_library(cache_dir, profanity_pattern)
+            state.lyrics_library = load_cached_lyrics_library(
+                cache_dir,
+                profanity_pattern,
+                state.ordered_track_ids,
+            )
 
-        identified = identify_track_from_transcript(transcript, state.lyrics_library) if transcript else None
+        if transcript:
+            state.transcript_history.append(transcript)
+            if len(state.transcript_history) > 4:
+                state.transcript_history = state.transcript_history[-4:]
+
+        search_text = " ".join(state.transcript_history[-3:])
+        identified = identify_track_from_transcript(search_text, state.lyrics_library) if search_text else None
         if identified is not None:
             track, line_index, aligned_ms, score = identified
             state.current_track_id = track.track_id
@@ -911,6 +983,7 @@ def maybe_duck_from_lyrics(
             state.current_progress_ms = aligned_ms
             state.last_alignment_ms = aligned_ms
             state.no_match_chunks = 0
+            state.transcript_history.clear()
             print(
                 f"[lyrics] identified track={state.current_track_name} at~{aligned_ms / 1000.0:.2f}s score={score:.2f}",
                 flush=True,
@@ -947,6 +1020,7 @@ def maybe_duck_from_lyrics(
             state.current_progress_ms = -1
             state.last_alignment_ms = -1
             state.triggered_timestamps_ms.clear()
+            state.transcript_history.clear()
             state.no_match_chunks = 0
             return
 
@@ -1221,6 +1295,9 @@ def main() -> int:
     lyrics_enabled = bool(args.lyrics_mode)
     lyrics_state = LyricsMonitorState()
 
+    if csv_paths:
+        lyrics_state.ordered_track_ids = ordered_track_keys_from_csv_paths(csv_paths)
+
     if lyrics_enabled:
         if spotify_token:
             print(
@@ -1279,7 +1356,11 @@ def main() -> int:
         return 0
 
     if lyrics_enabled and not spotify_token:
-        lyrics_state.lyrics_library = load_cached_lyrics_library(args.lyrics_cache_dir, profanity_pattern)
+        lyrics_state.lyrics_library = load_cached_lyrics_library(
+            args.lyrics_cache_dir,
+            profanity_pattern,
+            lyrics_state.ordered_track_ids,
+        )
         if lyrics_state.lyrics_library:
             print(
                 "[lyrics] Spotify API unavailable; using transcript-to-lyrics alignment from local cache.",
