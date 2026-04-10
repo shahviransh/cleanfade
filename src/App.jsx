@@ -13,6 +13,7 @@ const defaultConfig = {
   inputSource: "loopback",
   inputDevice: "",
   lyricsMode: false,
+  hfToken: "",
   spotifyToken: "",
   playlistId: "",
   prefetchPlaylistLyrics: false,
@@ -40,6 +41,7 @@ const formatConfig = (form) => ({
   input_source: String(form.inputSource || "loopback"),
   input_device: String(form.inputDevice || "").trim(),
   lyrics_mode: Boolean(form.lyricsMode),
+  hf_token: String(form.hfToken || "").trim(),
   spotify_token: String(form.spotifyToken || "").trim(),
   playlist_id: String(form.playlistId || "").trim(),
   prefetch_playlist_lyrics: Boolean(form.prefetchPlaylistLyrics),
@@ -312,6 +314,14 @@ function App() {
               <span className="help-dot" tabIndex={0} data-tip="Only build lyrics cache from CSV/API and exit without starting monitor.">?</span>
             </span>
             <input type="checkbox" checked={form.prefetchOnly} onChange={onBool("prefetchOnly")} />
+          </label>
+
+          <label className="wide">
+            <span className="label-title">
+              Hugging Face token (optional)
+              <span className="help-dot" tabIndex={0} data-tip="Optional token used for faster model downloads and higher Hugging Face Hub rate limits.">?</span>
+            </span>
+            <input type="password" placeholder="hf_..." value={form.hfToken} onChange={onText("hfToken")} />
           </label>
 
           <label className="wide">

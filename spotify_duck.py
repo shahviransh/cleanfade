@@ -1318,6 +1318,12 @@ def parse_args() -> argparse.Namespace:
         help="Spotify Web API access token. If omitted, uses SPOTIFY_ACCESS_TOKEN env var.",
     )
     parser.add_argument(
+        "--hf-token",
+        type=str,
+        default="",
+        help="Hugging Face token for authenticated model downloads. If omitted, uses HF_TOKEN env var.",
+    )
+    parser.add_argument(
         "--playlist-id",
         type=str,
         default="",
@@ -1466,6 +1472,12 @@ def find_loopback_mic(preferred_name: str = ""):
 
 def main() -> int:
     args = parse_args()
+
+    hf_token = args.hf_token.strip() or os.environ.get("HF_TOKEN", "").strip()
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+
     configure_huggingface_runtime()
 
     if args.list_devices:

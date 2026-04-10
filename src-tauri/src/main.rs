@@ -20,6 +20,7 @@ struct MonitorConfig {
     input_source: String,
     input_device: String,
     lyrics_mode: bool,
+    hf_token: String,
     spotify_token: String,
     playlist_id: String,
     prefetch_playlist_lyrics: bool,
@@ -83,6 +84,11 @@ async fn start_monitor(
 
     if config.lyrics_mode {
         args.push("--lyrics-mode".to_string());
+    }
+
+    if !config.hf_token.trim().is_empty() {
+        args.push("--hf-token".to_string());
+        args.push(config.hf_token);
     }
 
     if !config.spotify_token.trim().is_empty() {
