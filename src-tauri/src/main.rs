@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::Mutex;
