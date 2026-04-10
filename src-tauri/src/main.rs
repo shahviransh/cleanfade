@@ -103,6 +103,8 @@ async fn start_monitor(
 
     if config.lyrics_mode {
         args.push("--lyrics-mode".to_string());
+    } else {
+        args.push("--no-lyrics-mode".to_string());
     }
 
     if !config.hf_token.trim().is_empty() {

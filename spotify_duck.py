@@ -42,8 +42,8 @@ DEFAULT_BAD_WORDS = {
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 VAD_ASSET_NAME = "silero_encoder_v5.onnx"
 
-_VAD_FILTER_ENABLED = True
 _VAD_FILTER_LOCK = threading.Lock()
+_VAD_FILTER_STATE = {"enabled": True}
 
 
 def _is_missing_vad_asset_error(exc: Exception) -> bool:
@@ -239,10 +239,8 @@ def transcribe_chunk(
     chunk: np.ndarray,
     language: str,
 ) -> str:
-    global _VAD_FILTER_ENABLED
-
     with _VAD_FILTER_LOCK:
-        use_vad_filter = _VAD_FILTER_ENABLED
+        use_vad_filter = bool(_VAD_FILTER_STATE.get("enabled", True))
 
     try:
         segments, _ = model.transcribe(
@@ -259,8 +257,8 @@ def transcribe_chunk(
             raise
 
         with _VAD_FILTER_LOCK:
-            if _VAD_FILTER_ENABLED:
-                _VAD_FILTER_ENABLED = False
+            if bool(_VAD_FILTER_STATE.get("enabled", True)):
+                _VAD_FILTER_STATE["enabled"] = False
                 print(
                     "[transcribe] warning: missing faster-whisper VAD assets in sidecar; continuing with VAD disabled.",
                     flush=True,
@@ -277,6 +275,19 @@ def transcribe_chunk(
         )
 
     return " ".join(segment.text.strip() for segment in segments if segment.text).strip()
+
+
+def configure_transcription_mode(input_source: str) -> None:
+    normalized_source = input_source.strip().lower()
+    use_vad_filter = normalized_source != "loopback"
+
+    with _VAD_FILTER_LOCK:
+        _VAD_FILTER_STATE["enabled"] = use_vad_filter
+
+    if use_vad_filter:
+        print("[transcribe] VAD filter enabled (microphone mode).", flush=True)
+    else:
+        print("[transcribe] VAD filter disabled for loopback/music capture.", flush=True)
 
 
 def _spotify_headers(token: str) -> dict[str, str]:
@@ -1270,7 +1281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-size",
         type=str,
-        default="large-v3-turbo",
+        default="medium",
         choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3", "large-v3-turbo"],
         help="faster-whisper model size.",
     )
@@ -1589,8 +1600,18 @@ def main() -> int:
 
     preduck_ms = max(0, int(args.lyrics_preduck_seconds * 1000))
 
+    configure_transcription_mode(args.input_source)
+
     print(f"Loading Whisper model: {args.model_size}", flush=True)
+    if args.model_size in {"large-v1", "large-v2", "large-v3", "large-v3-turbo"}:
+        print(
+            "[model] first run may download model weights and take several minutes.",
+            flush=True,
+        )
+
+    model_load_started = time.time()
     model = WhisperModel(args.model_size, device="cpu", compute_type="int8")
+    print(f"[model] ready in {time.time() - model_load_started:.1f}s", flush=True)
 
     input_name = args.input_device.strip()
     if args.input_source == "microphone":
@@ -1620,6 +1641,7 @@ def main() -> int:
         raise ValueError("chunk-seconds and sample-rate produce invalid frame count.")
 
     low_rms_counter = 0
+    empty_transcript_counter = 0
 
     try:
         while running:
@@ -1664,6 +1686,17 @@ def main() -> int:
 
             if transcript and args.log_transcript:
                 print(f"[heard] {transcript}", flush=True)
+
+            if transcript:
+                empty_transcript_counter = 0
+            else:
+                empty_transcript_counter += 1
+                if empty_transcript_counter % 20 == 0:
+                    print(
+                        "[transcribe] no words detected yet; monitor is active. "
+                        "Try lowering --min-rms or setting --input-device.",
+                        flush=True,
+                    )
 
             if lyrics_enabled:
                 try:
