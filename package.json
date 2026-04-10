@@ -4,12 +4,22 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
     "tauri": "tauri",
     "build:sidecar": "powershell -ExecutionPolicy Bypass -File ./scripts/build_sidecar.ps1",
     "tauri:dev": "npm run build:sidecar && tauri dev",
     "tauri:build": "npm run build:sidecar && tauri build"
   },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
+    "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-react": "^4.5.2",
+    "vite": "^5.4.20"
   }
 }

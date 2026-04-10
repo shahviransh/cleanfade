@@ -1438,10 +1438,12 @@ def main() -> int:
         return 0
 
     csv_paths = [path for path in args.import_playlist_csv if str(path).strip()]
-    csv_prefetch_enabled = bool(args.prefetch_csv_lyrics or csv_paths)
-
-    if csv_prefetch_enabled and not csv_paths:
-        raise RuntimeError("--prefetch-csv-lyrics requires at least one --import-playlist-csv file.")
+    if args.prefetch_csv_lyrics and not csv_paths:
+        print(
+            "[lyrics] warning: --prefetch-csv-lyrics ignored because no --import-playlist-csv files were provided.",
+            flush=True,
+        )
+    csv_prefetch_enabled = bool(csv_paths)
 
     words = set(DEFAULT_BAD_WORDS)
     words.update(load_custom_words(args.profanity_file))
@@ -1574,11 +1576,20 @@ def main() -> int:
 
     try:
         while running:
-            captured = capture_device.record(
-                numframes=chunk_frames,
-                samplerate=args.sample_rate,
-                channels=1,
-            )
+            try:
+                captured = capture_device.record(
+                    numframes=chunk_frames,
+                    samplerate=args.sample_rate,
+                    channels=1,
+                )
+            except OSError as exc:
+                if getattr(exc, "errno", None) == 22:
+                    print(
+                        "[input] capture device became unavailable (Errno 22). Stopping monitor.",
+                        flush=True,
+                    )
+                    break
+                raise
 
             chunk = captured.reshape(-1).astype(np.float32)
 

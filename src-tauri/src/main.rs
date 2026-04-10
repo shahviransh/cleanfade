@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, State, WindowEvent};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::Mutex;
@@ -32,6 +32,13 @@ struct MonitorConfig {
 #[derive(Clone, Default)]
 struct MonitorState {
     child: Arc<Mutex<Option<CommandChild>>>,
+}
+
+async fn stop_monitor_child(child_state: Arc<Mutex<Option<CommandChild>>>) {
+    let mut lock = child_state.lock().await;
+    if let Some(child) = lock.take() {
+        let _ = child.kill();
+    }
 }
 
 #[tauri::command]
@@ -185,6 +192,16 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(MonitorState::default())
+        .on_window_event(|window, event| {
+            if !matches!(event, WindowEvent::CloseRequested { .. }) {
+                return;
+            }
+
+            let child_state = window.state::<MonitorState>().child.clone();
+            tauri::async_runtime::spawn(async move {
+                stop_monitor_child(child_state).await;
+            });
+        })
         .invoke_handler(tauri::generate_handler![start_monitor, stop_monitor])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
