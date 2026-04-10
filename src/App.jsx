@@ -116,6 +116,21 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!tauriReady) {
+      return undefined;
+    }
+
+    const onBeforeUnload = () => {
+      invoke("stop_monitor").catch(() => {});
+    };
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+    };
+  }, [tauriReady]);
+
   const onText = (field) => (event) => {
     const value = event.target.value;
     setForm((current) => ({ ...current, [field]: value }));

@@ -164,6 +164,11 @@ class SpotifyVolumeController:
     def __init__(self) -> None:
         try:
             from pycaw.pycaw import AudioUtilities
+        except ImportError as exc:
+            raise RuntimeError(
+                "Spotify volume control backend (pycaw) is unavailable on this platform. "
+                "CleanFade currently supports Spotify volume ducking on Windows."
+            ) from exc
         except OSError as exc:
             if getattr(exc, "winerror", None) == -2147417850:
                 raise RuntimeError(
@@ -1609,7 +1614,11 @@ def main() -> int:
 
             low_rms_counter = 0
 
-            transcript = transcribe_chunk(model, chunk, args.language).lower()
+            try:
+                transcript = transcribe_chunk(model, chunk, args.language).lower()
+            except OSError as exc:
+                print(f"[transcribe] warning: {exc}", flush=True)
+                continue
 
             if transcript and args.log_transcript:
                 print(f"[heard] {transcript}", flush=True)
