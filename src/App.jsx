@@ -19,7 +19,7 @@ const defaultConfig = {
   prefetchPlaylistLyrics: false,
   lyricsPreduckSeconds: 0.8,
   playlistCsvPaths: "",
-  prefetchCsvLyrics: false,
+  prefetchCsvLyrics: true,
   prefetchOnly: false,
   csvExportMode: true,
 };

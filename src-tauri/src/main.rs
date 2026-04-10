@@ -35,10 +35,29 @@ struct MonitorState {
     child: Arc<Mutex<Option<CommandChild>>>,
 }
 
+fn terminate_monitor_child(child: CommandChild) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let pid = child.pid().to_string();
+        if let Ok(status) = std::process::Command::new("taskkill")
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .status()
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    child
+        .kill()
+        .map_err(|e| format!("Failed to stop monitor process: {e}"))
+}
+
 async fn stop_monitor_child(child_state: Arc<Mutex<Option<CommandChild>>>) {
     let mut lock = child_state.lock().await;
     if let Some(child) = lock.take() {
-        let _ = child.kill();
+        let _ = terminate_monitor_child(child);
     }
 }
 
@@ -189,9 +208,7 @@ async fn stop_monitor(state: State<'_, MonitorState>) -> Result<(), String> {
         .take()
         .ok_or_else(|| "Monitor is not running.".to_string())?;
 
-    child
-        .kill()
-        .map_err(|e| format!("Failed to stop monitor process: {e}"))
+    terminate_monitor_child(child)
 }
 
 fn main() {
