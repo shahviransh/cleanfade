@@ -7,7 +7,7 @@ const defaultConfig = {
   duckPercent: 45,
   holdSeconds: 2.5,
   minRms: 0.002,
-  modelSize: "small",
+  modelSize: "medium",
   language: "en",
   profanityFile: "",
   inputSource: "loopback",
@@ -21,7 +21,7 @@ const defaultConfig = {
   playlistCsvPaths: "",
   prefetchCsvLyrics: false,
   prefetchOnly: false,
-  csvExportMode: false,
+  csvExportMode: true,
 };
 
 const isWarningText = (text) => {
