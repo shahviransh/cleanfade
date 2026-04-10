@@ -222,10 +222,13 @@ function App() {
               <span className="help-dot" tabIndex={0} data-tip="Speech model size. small/medium are more accurate but slower than tiny/base.">?</span>
             </span>
             <select value={form.modelSize} onChange={onText("modelSize")}>
-              <option>tiny.en</option>
-              <option>base.en</option>
-              <option>small.en</option>
-              <option>medium.en</option>
+              <option>tiny</option>
+              <option>base</option>
+              <option>small</option>
+              <option>medium</option>
+              <option>large-v1</option>
+              <option>large-v2</option>
+              <option>large-v3</option>
             </select>
           </label>
 

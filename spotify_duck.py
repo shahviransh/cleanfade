@@ -1270,8 +1270,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-size",
         type=str,
-        default="base.en",
-        choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en"],
+        default="large-v3",
+        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
         help="faster-whisper model size.",
     )
     parser.add_argument("--language", type=str, default="en", help="Whisper language code.")
