@@ -78,29 +78,41 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed to build cleanfade-engine."
 }
 
-$builtExe = Join-Path $binDir "cleanfade-engine.exe"
-if (-not (Test-Path $builtExe)) {
-    throw "Expected sidecar executable was not created: $builtExe"
+$builtBinary = Join-Path $binDir "cleanfade-engine"
+if (-not (Test-Path $builtBinary)) {
+    $builtBinary = Join-Path $binDir "cleanfade-engine.exe"
 }
 
-$hostTriple = "x86_64-pc-windows-msvc"
-try {
-    $rustcInfo = (rustc -vV 2>$null | Out-String)
-    $hostMatch = [regex]::Match($rustcInfo, "(?m)^\s*host:\s*([A-Za-z0-9._-]+)\s*$")
-    if ($hostMatch.Success) {
-        $hostTriple = $hostMatch.Groups[1].Value
+if (-not (Test-Path $builtBinary)) {
+    throw "Expected sidecar binary was not created at $binDir"
+}
+
+$targetTriple = $env:TAURI_ENV_TARGET_TRIPLE
+if ([string]::IsNullOrWhiteSpace($targetTriple)) {
+    $targetTriple = $env:CLEANFADE_TARGET_TRIPLE
+}
+
+if ([string]::IsNullOrWhiteSpace($targetTriple)) {
+    $targetTriple = "x86_64-pc-windows-msvc"
+    try {
+        $rustcInfo = (rustc -vV 2>$null | Out-String)
+        $hostMatch = [regex]::Match($rustcInfo, "(?m)^\s*host:\s*([A-Za-z0-9._-]+)\s*$")
+        if ($hostMatch.Success) {
+            $targetTriple = $hostMatch.Groups[1].Value
+        }
+    } catch {
+        Write-Host "rustc not found when detecting host triple. Using default: $targetTriple"
     }
-} catch {
-    Write-Host "rustc not found when detecting host triple. Using default: $hostTriple"
 }
 
-$hostTriple = ($hostTriple -replace "[^A-Za-z0-9._-]", "").Trim()
-if ([string]::IsNullOrWhiteSpace($hostTriple)) {
-    $hostTriple = "x86_64-pc-windows-msvc"
+$targetTriple = ($targetTriple -replace "[^A-Za-z0-9._-]", "").Trim()
+if ([string]::IsNullOrWhiteSpace($targetTriple)) {
+    $targetTriple = "x86_64-pc-windows-msvc"
 }
 
-$targetExe = Join-Path $binDir ("cleanfade-engine-" + $hostTriple + ".exe")
-Copy-Item -Path $builtExe -Destination $targetExe -Force
+$binaryExtension = [System.IO.Path]::GetExtension($builtBinary)
+$targetBinary = Join-Path $binDir ("cleanfade-engine-" + $targetTriple + $binaryExtension)
+Copy-Item -Path $builtBinary -Destination $targetBinary -Force
 
-Write-Host "Built sidecar:" $builtExe
-Write-Host "Copied sidecar for Tauri bundle:" $targetExe
+Write-Host "Built sidecar:" $builtBinary
+Write-Host "Copied sidecar for Tauri bundle:" $targetBinary

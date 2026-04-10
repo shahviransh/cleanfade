@@ -16,12 +16,16 @@ jobs:
       matrix:
         include:
           - platform: "macos-latest" # for Arm based macs (M1 and above).
+            target: "aarch64-apple-darwin"
             args: "--target aarch64-apple-darwin"
           - platform: 'macos-latest' # for Intel based macs.
+            target: "x86_64-apple-darwin"
             args: '--target x86_64-apple-darwin'
           - platform: "ubuntu-22.04" # for Tauri v1 you could replace this with ubuntu-22.04.
+            target: "x86_64-unknown-linux-gnu"
             args: ""
           - platform: "windows-latest"
+            target: "x86_64-pc-windows-msvc"
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -96,8 +100,4 @@ jobs:
           prerelease: false
           includeDebug: false
           includeRelease: true
-          args: ${{ matrix.target }}
-
-      - name: Debug with tmate on failure
-        if: ${{ failure() }}
-        uses: mxschmitt/action-tmate@v3
+          args: ${{ matrix.args }}
