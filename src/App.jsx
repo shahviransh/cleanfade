@@ -7,7 +7,7 @@ const defaultConfig = {
   duckPercent: 45,
   holdSeconds: 2.5,
   minRms: 0.002,
-  modelSize: "medium",
+  modelSize: "large-v3-turbo",
   language: "en",
   profanityFile: "",
   inputSource: "loopback",
@@ -231,6 +231,7 @@ function App() {
               <option>large-v1</option>
               <option>large-v2</option>
               <option>large-v3</option>
+              <option>large-v3-turbo</option>
             </select>
           </label>
 
