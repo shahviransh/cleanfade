@@ -113,6 +113,8 @@ class LyricsMonitorState:
     current_line_index: int = -1
     current_progress_ms: int = -1
     last_alignment_ms: int = -1
+    progress_anchor_ms: int = -1
+    progress_anchor_wall_time: float = 0.0
     no_match_chunks: int = 0
     lyrics_library: list["LyricsLibraryTrack"] = field(default_factory=list)
     ordered_track_ids: list[str] = field(default_factory=list)
@@ -1071,6 +1073,30 @@ def _apply_pending_track_lyrics_fetch(state: LyricsMonitorState) -> None:
     )
 
 
+def _set_progress_anchor(state: LyricsMonitorState, progress_ms: int, now: float | None = None) -> None:
+    if progress_ms < 0:
+        state.progress_anchor_ms = -1
+        state.progress_anchor_wall_time = 0.0
+        return
+
+    state.progress_anchor_ms = progress_ms
+    state.progress_anchor_wall_time = time.time() if now is None else now
+
+
+def _estimated_progress_ms(state: LyricsMonitorState, now: float | None = None) -> int:
+    progress_ms = state.current_progress_ms
+    if state.progress_anchor_ms < 0 or state.progress_anchor_wall_time <= 0.0:
+        return progress_ms
+
+    ref_now = time.time() if now is None else now
+    elapsed_ms = max(0, int((ref_now - state.progress_anchor_wall_time) * 1000.0))
+    projected_ms = state.progress_anchor_ms + elapsed_ms
+    if progress_ms < 0:
+        return projected_ms
+
+    return max(progress_ms, projected_ms)
+
+
 def maybe_duck_from_lyrics(
     controller: SpotifyVolumeController,
     state: LyricsMonitorState,
@@ -1097,6 +1123,7 @@ def maybe_duck_from_lyrics(
             track_name = str(current["track_name"])
             artist_name = str(current["artist_name"])
             state.current_progress_ms = int(current["progress_ms"])
+            _set_progress_anchor(state, state.current_progress_ms, now)
 
             if state.spotify_track_id != track_id:
                 state.spotify_track_id = track_id
@@ -1109,6 +1136,7 @@ def maybe_duck_from_lyrics(
                 state.last_alignment_ms = -1
                 state.no_match_chunks = 0
                 state.transcript_history.clear()
+                _set_progress_anchor(state, state.current_progress_ms, now)
                 _start_async_track_lyrics_fetch(
                     state=state,
                     track_id=track_id,
@@ -1146,6 +1174,7 @@ def maybe_duck_from_lyrics(
             state.current_line_index = line_index
             state.current_progress_ms = aligned_ms
             state.last_alignment_ms = aligned_ms
+            _set_progress_anchor(state, aligned_ms, now)
             state.no_match_chunks = 0
             state.transcript_history.clear()
             print(
@@ -1167,11 +1196,9 @@ def maybe_duck_from_lyrics(
         line_index, aligned_ms, _score = alignment
         state.current_line_index = line_index
         state.last_alignment_ms = aligned_ms
+        state.current_progress_ms = aligned_ms
+        _set_progress_anchor(state, aligned_ms, now)
         state.no_match_chunks = 0
-
-        # Use transcript alignment to keep timing accurate if API progress drifts.
-        if state.current_progress_ms < 0 or abs(state.current_progress_ms - aligned_ms) > 2500:
-            state.current_progress_ms = aligned_ms
     else:
         state.no_match_chunks += 1
         if not spotify_token and state.no_match_chunks >= 12:
@@ -1183,19 +1210,22 @@ def maybe_duck_from_lyrics(
             state.current_line_index = -1
             state.current_progress_ms = -1
             state.last_alignment_ms = -1
+            _set_progress_anchor(state, -1, now)
             state.triggered_timestamps_ms.clear()
             state.transcript_history.clear()
             state.no_match_chunks = 0
             return
 
-    progress_ms = state.current_progress_ms
-    if state.last_alignment_ms >= 0 and (progress_ms < 0 or abs(progress_ms - state.last_alignment_ms) > 4000):
+    progress_ms = _estimated_progress_ms(state, now)
+    if state.last_alignment_ms >= 0 and progress_ms < (state.last_alignment_ms - 4000):
         progress_ms = state.last_alignment_ms
 
     if progress_ms < 0:
         return
 
-    horizon_ms = progress_ms + preduck_ms
+    # Add a small lead buffer to account for chunking/transcription latency.
+    lead_padding_ms = 250 if spotify_token else 450
+    horizon_ms = progress_ms + preduck_ms + lead_padding_ms
     for timestamp_ms in state.profanity_timestamps_ms:
         if timestamp_ms in state.triggered_timestamps_ms:
             continue

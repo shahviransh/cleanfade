@@ -96,7 +96,7 @@ jobs:
           prerelease: false
           includeDebug: false
           includeRelease: true
-          args: --target ${{ matrix.target }}
+          args: ${{ matrix.target }}
 
       - name: Debug with tmate on failure
         if: ${{ failure() }}
