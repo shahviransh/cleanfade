@@ -20,6 +20,7 @@ const defaultConfig = {
   playlistCsvPaths: "",
   prefetchCsvLyrics: false,
   prefetchOnly: false,
+  csvExportMode: false,
 };
 
 const isWarningText = (text) => {
@@ -271,17 +272,27 @@ function App() {
             <input type="checkbox" checked={form.lyricsMode} onChange={onBool("lyricsMode")} />
           </label>
 
-          <div className="wide guidance-box">
-            <p>No Spotify token needed for CSV workflow. Export playlists as CSV and CleanFade will fetch lyrics from LRCLib.</p>
-            <p>For Spotify: use Exportify CSV. For Apple Music/YouTube/other platforms: use TuneMyMusic CSV.</p>
-          </div>
+          <label className="wide">
+            <span className="label-title">
+              <span>Not using Spotify token (CSV export mode)</span>
+              <span className="help-dot" tabIndex={0} data-tip="Use this mode if you do not have a Spotify token. Export your songs to CSV first, then paste CSV paths below.">?</span>
+            </span>
+            <input type="checkbox" checked={form.csvExportMode} onChange={onBool("csvExportMode")} />
+          </label>
+
+          {form.csvExportMode ? (
+            <div className="wide guidance-box">
+              <p>If you are not using a Spotify token, export your songs to CSV first.</p>
+              <p>Spotify playlists: use Exportify. Apple Music, YouTube Music, and other platforms: use TuneMyMusic.</p>
+            </div>
+          ) : null}
 
           <label className="wide">
             <span className="label-title">
               Playlist CSV paths
               <span className="help-dot" tabIndex={0} data-tip="Paste one or more CSV file paths (one per line). Supports Exportify and TuneMyMusic formats.">?</span>
             </span>
-            <textarea rows="3" placeholder={"C:/path/Exportify.csv\nC:/path/TuneMyMusic.csv"} value={form.playlistCsvPaths} onChange={onText("playlistCsvPaths")}></textarea>
+            <textarea rows="3" placeholder={"C:/path/your-songs-Exportify.csv\nC:/path/your-songs-TuneMyMusic.csv"} value={form.playlistCsvPaths} onChange={onText("playlistCsvPaths")}></textarea>
           </label>
 
           <label>
@@ -305,7 +316,7 @@ function App() {
               Spotify access token (optional)
               <span className="help-dot" tabIndex={0} data-tip="Only needed for Spotify API features like currently-playing pre-duck and playlist API prefetch.">?</span>
             </span>
-            <input type="password" placeholder="BQ..." value={form.spotifyToken} onChange={onText("spotifyToken")} />
+            <input type="password" placeholder="BQ..." value={form.spotifyToken} onChange={onText("spotifyToken")} disabled={form.csvExportMode} />
           </label>
 
           <label>
@@ -313,7 +324,7 @@ function App() {
               Playlist ID (optional)
               <span className="help-dot" tabIndex={0} data-tip="Used with prefetch to cache lyrics for all tracks in a playlist.">?</span>
             </span>
-            <input type="text" placeholder="37i9dQZF..." value={form.playlistId} onChange={onText("playlistId")} />
+            <input type="text" placeholder="37i9dQZF..." value={form.playlistId} onChange={onText("playlistId")} disabled={form.csvExportMode} />
           </label>
 
           <label>
@@ -321,7 +332,7 @@ function App() {
               Prefetch playlist lyrics
               <span className="help-dot" tabIndex={0} data-tip="When enabled, the monitor preloads lyrics cache for the playlist ID at start.">?</span>
             </span>
-            <input type="checkbox" checked={form.prefetchPlaylistLyrics} onChange={onBool("prefetchPlaylistLyrics")} />
+            <input type="checkbox" checked={form.prefetchPlaylistLyrics} onChange={onBool("prefetchPlaylistLyrics")} disabled={form.csvExportMode} />
           </label>
 
           <label>
