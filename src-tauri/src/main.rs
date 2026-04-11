@@ -134,7 +134,7 @@ async fn start_monitor(
         .map(ToString::to_string)
         .collect();
 
-    if config.prefetch_csv_lyrics || !csv_paths.is_empty() {
+    if config.prefetch_csv_lyrics && !csv_paths.is_empty() {
         args.push("--prefetch-csv-lyrics".to_string());
     }
 

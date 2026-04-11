@@ -39,8 +39,28 @@ DEFAULT_BAD_WORDS = {
     "shit",
 }
 
+DEFAULT_BAD_WORD_VARIANTS = {
+    "ass": {"asses"},
+    "asshole": {"assholes"},
+    "bastard": {"bastards"},
+    "bitch": {"bitches"},
+    "bullshit": {"bullshits", "bullshitting"},
+    "damn": {"damned", "damns"},
+    "dick": {"dicks"},
+    "fuck": {"fucked", "fucker", "fuckers", "fucks"},
+    "fucking": {"fuckin"},
+    "hell": {"hells"},
+    "motherfucker": {"motherfuckers"},
+    "shit": {"shits", "shitty", "shitting"},
+}
+
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 VAD_ASSET_NAME = "silero_encoder_v5.onnx"
+LARGE_WHISPER_MODELS = {"large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+FAST_START_BOOTSTRAP_MODEL = "small"
+LOOPBACK_CHUNK_SECONDS_DEFAULT = 1.2
+LOOPBACK_LYRICS_PREDUCK_SECONDS_DEFAULT = 1.25
+LOOPBACK_LYRICS_POLL_SECONDS_DEFAULT = 0.6
 
 _VAD_FILTER_LOCK = threading.Lock()
 _VAD_FILTER_STATE = {"enabled": True}
@@ -70,6 +90,14 @@ def build_word_regex(words: set[str]) -> re.Pattern[str]:
     escaped = sorted((re.escape(word) for word in words), key=len, reverse=True)
     pattern = r"\b(?:" + "|".join(escaped) + r")\b"
     return re.compile(pattern, re.IGNORECASE)
+
+
+def expand_profanity_words(words: set[str]) -> set[str]:
+    expanded = set(words)
+    for base_word, variants in DEFAULT_BAD_WORD_VARIANTS.items():
+        if base_word in expanded:
+            expanded.update(variants)
+    return expanded
 
 
 def load_custom_words(path: Path | None) -> set[str]:
@@ -168,8 +196,8 @@ class SpotifyVolumeController:
             from pycaw.pycaw import AudioUtilities
         except ImportError as exc:
             raise RuntimeError(
-                "Spotify volume control backend (pycaw) is unavailable on this platform. "
-                "CleanFade currently supports Spotify volume ducking on Windows."
+                "Music volume control backend (pycaw) is unavailable on this platform. "
+                "CleanFade currently supports Music volume ducking on Windows."
             ) from exc
         except OSError as exc:
             if getattr(exc, "winerror", None) == -2147417850:
@@ -288,6 +316,13 @@ def configure_transcription_mode(input_source: str) -> None:
         print("[transcribe] VAD filter enabled (microphone mode).", flush=True)
     else:
         print("[transcribe] VAD filter disabled for loopback/music capture.", flush=True)
+
+
+def load_whisper_model(model_size: str) -> WhisperModel:
+    model_load_started = time.time()
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    print(f"[model] ready model={model_size} in {time.time() - model_load_started:.1f}s", flush=True)
+    return model
 
 
 def _spotify_headers(token: str) -> dict[str, str]:
@@ -1138,7 +1173,7 @@ def maybe_duck_from_lyrics(
 
             if state.spotify_track_id != track_id:
                 state.spotify_track_id = track_id
-                state.current_track_id = ""
+                state.current_track_id = track_id
                 state.current_track_name = f"{track_name} - {artist_name}"
                 state.profanity_timestamps_ms = []
                 state.lyrics_lines = []
@@ -1148,6 +1183,24 @@ def maybe_duck_from_lyrics(
                 state.no_match_chunks = 0
                 state.transcript_history.clear()
                 _set_progress_anchor(state, state.current_progress_ms, now)
+                print(
+                    "[lyrics] now-playing "
+                    f"track={state.current_track_name} "
+                    f"at={state.current_progress_ms / 1000.0:.2f}s",
+                    flush=True,
+                )
+
+                cached = load_cached_track_lyrics(cache_dir, track_id, profanity_pattern)
+                if cached is not None:
+                    state.profanity_timestamps_ms = cached.profanity_timestamps_ms
+                    state.lyrics_lines = cached.lyrics_lines
+                    print(
+                        "[lyrics] cache-hit "
+                        f"track={state.current_track_name} "
+                        f"profane-lines={len(state.profanity_timestamps_ms)}",
+                        flush=True,
+                    )
+
                 _start_async_track_lyrics_fetch(
                     state=state,
                     track_id=track_id,
@@ -1235,12 +1288,13 @@ def maybe_duck_from_lyrics(
         return
 
     # Add a small lead buffer to account for chunking/transcription latency.
-    lead_padding_ms = 250 if spotify_token else 450
+    lead_padding_ms = 450 if spotify_token else 700
+    past_due_window_ms = 900 if spotify_token else 700
     horizon_ms = progress_ms + preduck_ms + lead_padding_ms
     for timestamp_ms in state.profanity_timestamps_ms:
         if timestamp_ms in state.triggered_timestamps_ms:
             continue
-        if (progress_ms - 250) <= timestamp_ms <= horizon_ms:
+        if (progress_ms - past_due_window_ms) <= timestamp_ms <= horizon_ms:
             controller.duck(duck_percent, hold_seconds)
             state.triggered_timestamps_ms.add(timestamp_ms)
             print(
@@ -1256,7 +1310,7 @@ def maybe_duck_from_lyrics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Duck Spotify volume when profanity is detected in currently playing audio."
+        description="Duck Music volume when profanity is detected in currently playing audio."
     )
     parser.add_argument("--sample-rate", type=int, default=16000, help="Audio sample rate.")
     parser.add_argument("--chunk-seconds", type=float, default=2.0, help="Chunk length in seconds.")
@@ -1383,7 +1437,22 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Exit after prefetch jobs (CSV/API) instead of starting live audio monitor.",
     )
-    return parser.parse_args()
+
+    parsed = parser.parse_args()
+    argv = sys.argv[1:]
+    parsed.model_size_user_set = _argument_explicitly_set(argv, "--model-size")
+    parsed.chunk_seconds_user_set = _argument_explicitly_set(argv, "--chunk-seconds")
+    parsed.lyrics_preduck_seconds_user_set = _argument_explicitly_set(argv, "--lyrics-preduck-seconds")
+    parsed.lyrics_poll_seconds_user_set = _argument_explicitly_set(argv, "--lyrics-poll-seconds")
+    return parsed
+
+
+def _argument_explicitly_set(argv: list[str], option_name: str) -> bool:
+    if option_name in argv:
+        return True
+
+    option_prefix = f"{option_name}="
+    return any(argument.startswith(option_prefix) for argument in argv)
 
 
 def _normalize_name(value: str) -> str:
@@ -1491,6 +1560,37 @@ def main() -> int:
 
     configure_huggingface_runtime()
 
+    if args.input_source == "loopback":
+        if not bool(getattr(args, "chunk_seconds_user_set", False)) and args.chunk_seconds > LOOPBACK_CHUNK_SECONDS_DEFAULT:
+            args.chunk_seconds = LOOPBACK_CHUNK_SECONDS_DEFAULT
+            print(
+                "[transcribe] loopback low-latency mode: using shorter audio chunks for faster lyric matching.",
+                flush=True,
+            )
+
+        if not bool(getattr(args, "model_size_user_set", False)) and args.model_size not in {
+            "tiny",
+            "base",
+            "small",
+        }:
+            args.model_size = FAST_START_BOOTSTRAP_MODEL
+            print(
+                "[model] loopback low-latency mode: using small model by default (override with --model-size).",
+                flush=True,
+            )
+
+        if (
+            not bool(getattr(args, "lyrics_preduck_seconds_user_set", False))
+            and args.lyrics_preduck_seconds < LOOPBACK_LYRICS_PREDUCK_SECONDS_DEFAULT
+        ):
+            args.lyrics_preduck_seconds = LOOPBACK_LYRICS_PREDUCK_SECONDS_DEFAULT
+
+        if (
+            not bool(getattr(args, "lyrics_poll_seconds_user_set", False))
+            and args.lyrics_poll_seconds > LOOPBACK_LYRICS_POLL_SECONDS_DEFAULT
+        ):
+            args.lyrics_poll_seconds = LOOPBACK_LYRICS_POLL_SECONDS_DEFAULT
+
     if args.list_devices:
         list_capture_devices()
         return 0
@@ -1505,6 +1605,7 @@ def main() -> int:
 
     words = set(DEFAULT_BAD_WORDS)
     words.update(load_custom_words(args.profanity_file))
+    words = expand_profanity_words(words)
     if not words:
         raise RuntimeError("No profanity words configured.")
 
@@ -1602,16 +1703,71 @@ def main() -> int:
 
     configure_transcription_mode(args.input_source)
 
-    print(f"Loading Whisper model: {args.model_size}", flush=True)
-    if args.model_size in {"large-v1", "large-v2", "large-v3", "large-v3-turbo"}:
+    requested_model_size = args.model_size
+    model_lock = threading.Lock()
+    model_state: dict[str, Any] = {
+        "active": None,
+        "active_name": "",
+        "loading_target": "",
+    }
+
+    print(f"Loading Whisper model: {requested_model_size}", flush=True)
+    if requested_model_size in LARGE_WHISPER_MODELS:
         print(
             "[model] first run may download model weights and take several minutes.",
             flush=True,
         )
 
-    model_load_started = time.time()
-    model = WhisperModel(args.model_size, device="cpu", compute_type="int8")
-    print(f"[model] ready in {time.time() - model_load_started:.1f}s", flush=True)
+        bootstrap_model_size = FAST_START_BOOTSTRAP_MODEL
+        if requested_model_size == FAST_START_BOOTSTRAP_MODEL:
+            bootstrap_model_size = requested_model_size
+
+        if bootstrap_model_size != requested_model_size:
+            print(
+                "[model] fast-start: booting with "
+                f"{bootstrap_model_size}; {requested_model_size} will load in background.",
+                flush=True,
+            )
+
+        active_model = load_whisper_model(bootstrap_model_size)
+        with model_lock:
+            model_state["active"] = active_model
+            model_state["active_name"] = bootstrap_model_size
+            model_state["loading_target"] = (
+                requested_model_size if bootstrap_model_size != requested_model_size else ""
+            )
+
+        if bootstrap_model_size != requested_model_size:
+            def upgrade_model_worker() -> None:
+                try:
+                    upgraded_model = load_whisper_model(requested_model_size)
+                except Exception as exc:
+                    print(
+                        f"[model] warning: background load failed for {requested_model_size}: {exc}",
+                        flush=True,
+                    )
+                    with model_lock:
+                        model_state["loading_target"] = ""
+                    return
+
+                with model_lock:
+                    model_state["active"] = upgraded_model
+                    model_state["active_name"] = requested_model_size
+                    model_state["loading_target"] = ""
+
+                print(f"[model] switched to {requested_model_size}", flush=True)
+
+            threading.Thread(
+                target=upgrade_model_worker,
+                name="whisper-model-upgrade",
+                daemon=True,
+            ).start()
+    else:
+        active_model = load_whisper_model(requested_model_size)
+        with model_lock:
+            model_state["active"] = active_model
+            model_state["active_name"] = requested_model_size
+            model_state["loading_target"] = ""
 
     input_name = args.input_device.strip()
     if args.input_source == "microphone":
@@ -1678,8 +1834,15 @@ def main() -> int:
 
             low_rms_counter = 0
 
+            with model_lock:
+                current_model = model_state.get("active")
+
+            if current_model is None:
+                print("[model] warning: transcription model is unavailable.", flush=True)
+                continue
+
             try:
-                transcript = transcribe_chunk(model, chunk, args.language).lower()
+                transcript = transcribe_chunk(current_model, chunk, args.language).lower()
             except OSError as exc:
                 print(f"[transcribe] warning: {exc}", flush=True)
                 continue

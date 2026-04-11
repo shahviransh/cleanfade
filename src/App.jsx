@@ -182,14 +182,14 @@ function App() {
         <header>
           <p className="eyebrow">Desktop profanity guard</p>
           <h1>CleanFade</h1>
-          <p className="subtext">Reduce Spotify volume whenever curse words are detected.</p>
+          <p className="subtext">Reduce Music volume whenever curse words are detected.</p>
         </header>
 
         <section className="grid">
           <label>
             <span className="label-title">
               Duck percent
-              <span className="help-dot" tabIndex={0} data-tip="How much to lower Spotify volume when profanity is detected.">?</span>
+              <span className="help-dot" tabIndex={0} data-tip="How much to lower Music volume when profanity is detected.">?</span>
             </span>
             <input type="number" min="0" max="100" step="1" value={form.duckPercent} onChange={onText("duckPercent")} />
           </label>

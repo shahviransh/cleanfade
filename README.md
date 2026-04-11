@@ -1,6 +1,6 @@
 # CleanFade
 
-CleanFade is a Windows desktop app that lowers Spotify volume when profanity is detected in currently playing audio.
+CleanFade is a Windows desktop app that lowers Music volume when profanity is detected in currently playing audio.
 
 The project includes:
 
@@ -140,4 +140,4 @@ Notes:
 ## Safety
 
 - Start with a low duck value such as 25.
-- Stopping the monitor restores baseline Spotify volume.
+- Stopping the monitor restores baseline Music volume.
