@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import csv
 import hashlib
 import json
@@ -61,6 +62,9 @@ FAST_START_BOOTSTRAP_MODEL = "small"
 LOOPBACK_CHUNK_SECONDS_DEFAULT = 1.2
 LOOPBACK_LYRICS_PREDUCK_SECONDS_DEFAULT = 1.25
 LOOPBACK_LYRICS_POLL_SECONDS_DEFAULT = 0.6
+ESTIMATION_TOKEN_HISTORY_MAX = 8
+ESTIMATION_TOKEN_UNIQUE_MAX = 360
+ESTIMATION_TOKEN_UNIQUE_PRUNED = 240
 
 _VAD_FILTER_LOCK = threading.Lock()
 _VAD_FILTER_STATE = {"enabled": True}
@@ -147,6 +151,7 @@ class LyricsMonitorState:
     lyrics_library: list["LyricsLibraryTrack"] = field(default_factory=list)
     ordered_track_ids: list[str] = field(default_factory=list)
     transcript_history: list[str] = field(default_factory=list)
+    transcript_token_counts: Counter[str] = field(default_factory=Counter)
     last_poll_time: float = 0.0
     last_error: str = ""
     lyrics_fetch_request_id: int = 0
@@ -862,6 +867,33 @@ def line_match_score(transcript_normalized: str, transcript_tokens: set[str], li
     return overlap_ratio * 0.65 + coverage_ratio * 0.35 + phrase_bonus
 
 
+def _clear_transcript_estimation_state(state: LyricsMonitorState) -> None:
+    state.transcript_history.clear()
+    state.transcript_token_counts.clear()
+
+
+def _accumulate_transcript_tokens(state: LyricsMonitorState, transcript: str) -> None:
+    normalized = normalize_lyric_text(transcript)
+    if not normalized:
+        return
+
+    state.transcript_history.append(normalized)
+    if len(state.transcript_history) > ESTIMATION_TOKEN_HISTORY_MAX:
+        state.transcript_history = state.transcript_history[-ESTIMATION_TOKEN_HISTORY_MAX:]
+
+    for token in TOKEN_RE.findall(normalized):
+        if len(token) <= 1:
+            continue
+        previous = int(state.transcript_token_counts.get(token, 0))
+        state.transcript_token_counts[token] = min(8, previous + 1)
+
+    if len(state.transcript_token_counts) > ESTIMATION_TOKEN_UNIQUE_MAX:
+        # Keep the most repeated tokens to preserve signal while bounding memory.
+        state.transcript_token_counts = Counter(
+            dict(state.transcript_token_counts.most_common(ESTIMATION_TOKEN_UNIQUE_PRUNED))
+        )
+
+
 def align_transcript_to_line(
     transcript: str,
     lyrics_lines: list[LyricLine],
@@ -1018,6 +1050,96 @@ def identify_track_from_transcript(
     return best
 
 
+def identify_track_from_accumulated_tokens(
+    transcript_token_counts: Counter[str],
+    recent_transcript: str,
+    library: list[LyricsLibraryTrack],
+) -> tuple[LyricsLibraryTrack, int, int, float] | None:
+    if not transcript_token_counts or not library:
+        return None
+
+    token_track_frequency: dict[str, int] = {}
+    for track in library:
+        for token in track.token_union:
+            token_track_frequency[token] = token_track_frequency.get(token, 0) + 1
+
+    token_weights: dict[str, float] = {}
+    for token, count in transcript_token_counts.items():
+        if count <= 0 or len(token) <= 1:
+            continue
+
+        track_frequency = token_track_frequency.get(token)
+        if not track_frequency:
+            continue
+
+        token_weights[token] = min(float(count), 3.0) / float(track_frequency)
+
+    if len(token_weights) < 3:
+        return None
+
+    total_weight = sum(token_weights.values())
+    if total_weight <= 0.0:
+        return None
+
+    weighted_token_set = set(token_weights.keys())
+    candidates: list[tuple[LyricsLibraryTrack, float]] = []
+    for track in library:
+        overlap_tokens = weighted_token_set & track.token_union
+        if len(overlap_tokens) < 2:
+            continue
+
+        overlap_weight = sum(token_weights[token] for token in overlap_tokens)
+        weighted_precision = overlap_weight / total_weight
+        unique_precision = len(overlap_tokens) / max(1, len(weighted_token_set))
+        overlap_bonus = min(0.18, len(overlap_tokens) / 18.0)
+        candidate_score = weighted_precision * 0.78 + unique_precision * 0.12 + overlap_bonus
+        candidates.append((track, candidate_score))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    best_track, best_score = candidates[0]
+    second_best_score = candidates[1][1] if len(candidates) > 1 else 0.0
+
+    min_accept = 0.34 if len(weighted_token_set) >= 10 else 0.42
+    if best_score < min_accept:
+        return None
+
+    if second_best_score > 0 and (best_score - second_best_score) < 0.05:
+        return None
+
+    line_index = -1
+    aligned_ms = -1
+    if recent_transcript:
+        alignment = align_transcript_to_line(
+            transcript=recent_transcript,
+            lyrics_lines=best_track.lyrics_lines,
+            current_line_index=-1,
+            min_score=0.40,
+        )
+        if alignment is not None:
+            line_index, aligned_ms, _score = alignment
+
+    if line_index < 0:
+        best_line_index = -1
+        best_line_score = 0.0
+        for index, line in enumerate(best_track.lyrics_lines):
+            overlap_weight = sum(token_weights.get(token, 0.0) for token in line.token_set)
+            if overlap_weight <= 0.0:
+                continue
+            line_score = overlap_weight / max(1.0, math.sqrt(float(len(line.token_set))))
+            if line_score > best_line_score:
+                best_line_score = line_score
+                best_line_index = index
+
+        if best_line_index >= 0:
+            line_index = best_line_index
+            aligned_ms = best_track.lyrics_lines[best_line_index].timestamp_ms
+
+    return best_track, line_index, aligned_ms, best_score
+
+
 def _start_async_track_lyrics_fetch(
     state: LyricsMonitorState,
     track_id: str,
@@ -1110,7 +1232,7 @@ def _apply_pending_track_lyrics_fetch(state: LyricsMonitorState) -> None:
     state.current_line_index = -1
     state.last_alignment_ms = -1
     state.no_match_chunks = 0
-    state.transcript_history.clear()
+    _clear_transcript_estimation_state(state)
     state.last_error = ""
 
     print(
@@ -1181,7 +1303,7 @@ def maybe_duck_from_lyrics(
                 state.current_line_index = -1
                 state.last_alignment_ms = -1
                 state.no_match_chunks = 0
-                state.transcript_history.clear()
+                _clear_transcript_estimation_state(state)
                 _set_progress_anchor(state, state.current_progress_ms, now)
                 print(
                     "[lyrics] now-playing "
@@ -1222,14 +1344,17 @@ def maybe_duck_from_lyrics(
             )
 
         if transcript:
-            state.transcript_history.append(transcript)
-            if len(state.transcript_history) > 4:
-                state.transcript_history = state.transcript_history[-4:]
+            _accumulate_transcript_tokens(state, transcript)
 
         search_text = " ".join(state.transcript_history[-3:])
-        identified = identify_track_from_transcript(search_text, state.lyrics_library) if search_text else None
+        identified = identify_track_from_accumulated_tokens(
+            transcript_token_counts=state.transcript_token_counts,
+            recent_transcript=search_text,
+            library=state.lyrics_library,
+        )
         if identified is not None:
             track, line_index, aligned_ms, score = identified
+            token_count = len(state.transcript_token_counts)
             state.current_track_id = track.track_id
             state.current_track_name = f"{track.track_name} - {track.artist_name}".strip(" -")
             state.profanity_timestamps_ms = track.profanity_timestamps_ms
@@ -1240,9 +1365,10 @@ def maybe_duck_from_lyrics(
             state.last_alignment_ms = aligned_ms
             _set_progress_anchor(state, aligned_ms, now)
             state.no_match_chunks = 0
-            state.transcript_history.clear()
+            _clear_transcript_estimation_state(state)
             print(
-                f"[lyrics] identified track={state.current_track_name} at~{aligned_ms / 1000.0:.2f}s score={score:.2f}",
+                f"[lyrics] identified track={state.current_track_name} at~{aligned_ms / 1000.0:.2f}s "
+                f"score={score:.2f} tokens={token_count}",
                 flush=True,
             )
         else:
@@ -1276,7 +1402,7 @@ def maybe_duck_from_lyrics(
             state.last_alignment_ms = -1
             _set_progress_anchor(state, -1, now)
             state.triggered_timestamps_ms.clear()
-            state.transcript_history.clear()
+            _clear_transcript_estimation_state(state)
             state.no_match_chunks = 0
             return
 
