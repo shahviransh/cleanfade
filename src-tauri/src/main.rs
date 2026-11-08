@@ -36,17 +36,32 @@ struct MonitorState {
 }
 
 fn terminate_monitor_child(child: CommandChild) -> Result<(), String> {
+    let pid = child.pid();
+
     #[cfg(windows)]
     {
-        let pid = child.pid().to_string();
+        let pid_str = pid.to_string();
         if let Ok(status) = std::process::Command::new("taskkill")
-            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .args(["/PID", &pid_str, "/T", "/F"])
             .status()
         {
             if status.success() {
                 return Ok(());
             }
         }
+    }
+
+    #[cfg(unix)]
+    {
+        // Prefer process-group termination so PyInstaller helper children exit too.
+        let group_target = format!("-{pid}");
+        let pid_str = pid.to_string();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &group_target])
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .status();
     }
 
     child

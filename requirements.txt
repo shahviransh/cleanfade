@@ -4,3 +4,7 @@ numpy==1.26.4
 pycaw==20240210; platform_system == "Windows"
 requests==2.32.5
 soundcard==0.4.3
+# Volume control:
+#   Windows -> pycaw
+#   macOS   -> osascript (system)
+#   Linux   -> pactl or playerctl (system packages)

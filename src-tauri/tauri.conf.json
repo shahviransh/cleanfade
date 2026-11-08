@@ -33,6 +33,10 @@
     ],
     "externalBin": [
       "bin/cleanfade-engine"
-    ]
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

@@ -6,18 +6,22 @@ import json
 import logging
 import math
 import os
+import platform
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 # Keep COM in MTA mode so pycaw/comtypes matches thread state set by other audio libs.
-sys.coinit_flags = 0
+if sys.platform == "win32":
+    sys.coinit_flags = 0
 
 import numpy as np
 import requests
@@ -65,6 +69,9 @@ LOOPBACK_LYRICS_POLL_SECONDS_DEFAULT = 0.6
 ESTIMATION_TOKEN_HISTORY_MAX = 8
 ESTIMATION_TOKEN_UNIQUE_MAX = 360
 ESTIMATION_TOKEN_UNIQUE_PRUNED = 240
+ESTIMATION_TOP_TOKENS_MAX = 96
+ESTIMATION_IDENTIFY_MIN_INTERVAL_SECONDS = 0.35
+SPOTIFY_POLL_TIMEOUT_SECONDS_MAX = 3.0
 
 _VAD_FILTER_LOCK = threading.Lock()
 _VAD_FILTER_STATE = {"enabled": True}
@@ -149,9 +156,12 @@ class LyricsMonitorState:
     progress_anchor_wall_time: float = 0.0
     no_match_chunks: int = 0
     lyrics_library: list["LyricsLibraryTrack"] = field(default_factory=list)
+    lyrics_library_token_track_frequency: dict[str, int] = field(default_factory=dict)
     ordered_track_ids: list[str] = field(default_factory=list)
     transcript_history: list[str] = field(default_factory=list)
     transcript_token_counts: Counter[str] = field(default_factory=Counter)
+    last_identify_attempt_wall_time: float = 0.0
+    last_identify_token_count: int = 0
     last_poll_time: float = 0.0
     last_error: str = ""
     lyrics_fetch_request_id: int = 0
@@ -195,14 +205,36 @@ class PendingLyricsFetchResult:
     error: str = ""
 
 
-class SpotifyVolumeController:
+class VolumeBackend(Protocol):
+    name: str
+
+    def get_volume(self) -> float: ...
+
+    def set_volume(self, level: float) -> None: ...
+
+
+def _run_command(args: list[str], *, timeout_seconds: float = 5.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds,
+        check=False,
+    )
+
+
+class WindowsPycawVolumeBackend:
+    name = "windows-pycaw"
+
     def __init__(self) -> None:
         try:
             from pycaw.pycaw import AudioUtilities
         except ImportError as exc:
             raise RuntimeError(
-                "Music volume control backend (pycaw) is unavailable on this platform. "
-                "CleanFade currently supports Music volume ducking on Windows."
+                "Music volume control backend (pycaw) is unavailable. "
+                "Install Windows requirements from requirements.txt."
             ) from exc
         except OSError as exc:
             if getattr(exc, "winerror", None) == -2147417850:
@@ -214,7 +246,6 @@ class SpotifyVolumeController:
             raise
 
         self._audio_utilities = AudioUtilities
-        self._state = DuckState()
 
     def _spotify_simple_volume(self):
         for session in self._audio_utilities.GetAllSessions():
@@ -238,6 +269,199 @@ class SpotifyVolumeController:
             raise RuntimeError("Spotify audio session not found. Start playback and keep Spotify open.")
         bounded = max(0.0, min(1.0, level))
         simple_volume.SetMasterVolume(bounded, None)
+
+
+class MacOsascriptVolumeBackend:
+    name = "macos-osascript"
+
+    def __init__(self) -> None:
+        if shutil.which("osascript") is None:
+            raise RuntimeError("osascript is required to control Spotify volume on macOS.")
+
+    def _run_spotify_script(self, script: str) -> str:
+        result = _run_command(["osascript", "-e", script])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Unable to control Spotify via AppleScript. "
+                "Keep Spotify open and allow Automation access for CleanFade"
+                + (f": {detail}" if detail else ".")
+            )
+        return (result.stdout or "").strip()
+
+    def get_volume(self) -> float:
+        raw = self._run_spotify_script('tell application "Spotify" to get sound volume')
+        try:
+            return max(0.0, min(1.0, float(raw) / 100.0))
+        except ValueError as exc:
+            raise RuntimeError(f"Unexpected Spotify volume response from AppleScript: {raw!r}") from exc
+
+    def set_volume(self, level: float) -> None:
+        bounded = max(0.0, min(1.0, level))
+        percent = int(round(bounded * 100.0))
+        self._run_spotify_script(f'tell application "Spotify" to set sound volume to {percent}')
+
+
+class LinuxPulseVolumeBackend:
+    name = "linux-pulse"
+
+    _SINK_INPUT_RE = re.compile(r"^Sink Input #(\d+)\s*$")
+    _VOLUME_PERCENT_RE = re.compile(r"/\s*(\d+)%")
+
+    def __init__(self) -> None:
+        if shutil.which("pactl") is None:
+            raise RuntimeError(
+                "pactl is required to control Spotify volume on Linux. "
+                "Install PulseAudio/PipeWire tools (pulseaudio-utils or pipewire-pulse)."
+            )
+
+    def _spotify_sink_input(self) -> tuple[str, float]:
+        result = _run_command(["pactl", "list", "sink-inputs"])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Failed to query PulseAudio/PipeWire sink inputs"
+                + (f": {detail}" if detail else ".")
+            )
+
+        current_id: str | None = None
+        current_volume = 1.0
+        current_is_spotify = False
+        best: tuple[str, float] | None = None
+
+        def commit_block() -> None:
+            nonlocal best
+            if current_id is not None and current_is_spotify:
+                best = (current_id, current_volume)
+
+        for raw_line in (result.stdout or "").splitlines():
+            line = raw_line.strip()
+            sink_match = self._SINK_INPUT_RE.match(raw_line.rstrip())
+            if sink_match:
+                commit_block()
+                current_id = sink_match.group(1)
+                current_volume = 1.0
+                current_is_spotify = False
+                continue
+
+            if current_id is None:
+                continue
+
+            lower = line.lower()
+            if lower.startswith("volume:"):
+                percents = [int(value) for value in self._VOLUME_PERCENT_RE.findall(line)]
+                if percents:
+                    current_volume = max(0.0, min(1.0, (sum(percents) / len(percents)) / 100.0))
+                continue
+
+            if any(
+                marker in lower
+                for marker in (
+                    "application.name = \"spotify",
+                    "application.process.binary = \"spotify",
+                    "media.name = \"spotify",
+                    "application.process.binary = \"spotify.exe",
+                )
+            ) or (
+                "application.name = " in lower and "spotify" in lower
+            ) or (
+                "application.process.binary = " in lower and "spotify" in lower
+            ):
+                current_is_spotify = True
+
+        commit_block()
+        if best is None:
+            raise RuntimeError(
+                "Spotify audio stream not found in PulseAudio/PipeWire. "
+                "Start playback in Spotify and keep it open."
+            )
+        return best
+
+    def get_volume(self) -> float:
+        _, volume = self._spotify_sink_input()
+        return volume
+
+    def set_volume(self, level: float) -> None:
+        sink_input_id, _ = self._spotify_sink_input()
+        bounded = max(0.0, min(1.0, level))
+        percent = int(round(bounded * 100.0))
+        result = _run_command(["pactl", "set-sink-input-volume", sink_input_id, f"{percent}%"])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Failed to set Spotify sink-input volume"
+                + (f": {detail}" if detail else ".")
+            )
+
+
+class LinuxPlayerctlVolumeBackend:
+    name = "linux-playerctl"
+
+    def __init__(self) -> None:
+        if shutil.which("playerctl") is None:
+            raise RuntimeError("playerctl is unavailable.")
+
+    def get_volume(self) -> float:
+        result = _run_command(["playerctl", "--player=spotify", "volume"])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Unable to read Spotify volume via playerctl. Keep Spotify open"
+                + (f": {detail}" if detail else ".")
+            )
+        raw = (result.stdout or "").strip()
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except ValueError as exc:
+            raise RuntimeError(f"Unexpected playerctl volume response: {raw!r}") from exc
+
+    def set_volume(self, level: float) -> None:
+        bounded = max(0.0, min(1.0, level))
+        result = _run_command(["playerctl", "--player=spotify", "volume", f"{bounded:.4f}"])
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                "Unable to set Spotify volume via playerctl"
+                + (f": {detail}" if detail else ".")
+            )
+
+
+def create_volume_backend() -> VolumeBackend:
+    system = platform.system()
+
+    if system == "Windows":
+        return WindowsPycawVolumeBackend()
+
+    if system == "Darwin":
+        return MacOsascriptVolumeBackend()
+
+    if system == "Linux":
+        if shutil.which("pactl"):
+            return LinuxPulseVolumeBackend()
+        if shutil.which("playerctl"):
+            return LinuxPlayerctlVolumeBackend()
+        raise RuntimeError(
+            "Unable to initialize Linux Spotify volume control. "
+            "Install PulseAudio/PipeWire tools (pactl) or playerctl."
+        )
+
+    raise RuntimeError(
+        f"Unsupported platform for Spotify volume ducking: {system}. "
+        "CleanFade supports Windows, macOS, and Linux."
+    )
+
+
+class SpotifyVolumeController:
+    def __init__(self) -> None:
+        self._backend = create_volume_backend()
+        self._state = DuckState()
+        print(f"[volume] backend={self._backend.name}", flush=True)
+
+    def get_volume(self) -> float:
+        return self._backend.get_volume()
+
+    def set_volume(self, level: float) -> None:
+        self._backend.set_volume(level)
 
     def duck(self, duck_percent: float, hold_seconds: float) -> None:
         now = time.time()
@@ -355,11 +579,12 @@ def _extract_track_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def get_current_spotify_track(token: str) -> dict[str, Any] | None:
+def get_current_spotify_track(token: str, timeout_seconds: float = 5.0) -> dict[str, Any] | None:
+    request_timeout = max(0.8, float(timeout_seconds))
     response = requests.get(
         "https://api.spotify.com/v1/me/player/currently-playing",
         headers=_spotify_headers(token),
-        timeout=5,
+        timeout=request_timeout,
     )
 
     if response.status_code == 204:
@@ -367,7 +592,7 @@ def get_current_spotify_track(token: str) -> dict[str, Any] | None:
         response = requests.get(
             "https://api.spotify.com/v1/me/player",
             headers=_spotify_headers(token),
-            timeout=5,
+            timeout=request_timeout,
         )
         if response.status_code == 204:
             return None
@@ -870,6 +1095,8 @@ def line_match_score(transcript_normalized: str, transcript_tokens: set[str], li
 def _clear_transcript_estimation_state(state: LyricsMonitorState) -> None:
     state.transcript_history.clear()
     state.transcript_token_counts.clear()
+    state.last_identify_attempt_wall_time = 0.0
+    state.last_identify_token_count = 0
 
 
 def _accumulate_transcript_tokens(state: LyricsMonitorState, transcript: str) -> None:
@@ -881,7 +1108,7 @@ def _accumulate_transcript_tokens(state: LyricsMonitorState, transcript: str) ->
     if len(state.transcript_history) > ESTIMATION_TOKEN_HISTORY_MAX:
         state.transcript_history = state.transcript_history[-ESTIMATION_TOKEN_HISTORY_MAX:]
 
-    for token in TOKEN_RE.findall(normalized):
+    for token in normalized.split():
         if len(token) <= 1:
             continue
         previous = int(state.transcript_token_counts.get(token, 0))
@@ -986,6 +1213,14 @@ def load_cached_lyrics_library(
     return library
 
 
+def build_library_token_track_frequency(library: list[LyricsLibraryTrack]) -> dict[str, int]:
+    token_track_frequency: dict[str, int] = {}
+    for track in library:
+        for token in track.token_union:
+            token_track_frequency[token] = token_track_frequency.get(token, 0) + 1
+    return token_track_frequency
+
+
 def identify_track_from_transcript(
     transcript: str,
     library: list[LyricsLibraryTrack],
@@ -1054,30 +1289,34 @@ def identify_track_from_accumulated_tokens(
     transcript_token_counts: Counter[str],
     recent_transcript: str,
     library: list[LyricsLibraryTrack],
+    token_track_frequency: dict[str, int] | None = None,
 ) -> tuple[LyricsLibraryTrack, int, int, float] | None:
     if not transcript_token_counts or not library:
         return None
 
-    token_track_frequency: dict[str, int] = {}
-    for track in library:
-        for token in track.token_union:
-            token_track_frequency[token] = token_track_frequency.get(token, 0) + 1
+    token_frequency = token_track_frequency if token_track_frequency is not None else build_library_token_track_frequency(library)
 
-    token_weights: dict[str, float] = {}
+    weighted_items: list[tuple[str, float]] = []
     for token, count in transcript_token_counts.items():
         if count <= 0 or len(token) <= 1:
             continue
 
-        track_frequency = token_track_frequency.get(token)
+        track_frequency = token_frequency.get(token)
         if not track_frequency:
             continue
 
-        token_weights[token] = min(float(count), 3.0) / float(track_frequency)
+        weight = min(float(count), 3.0) / float(track_frequency)
+        weighted_items.append((token, weight))
 
-    if len(token_weights) < 3:
+    if len(weighted_items) < 3:
         return None
 
-    total_weight = sum(token_weights.values())
+    weighted_items.sort(key=lambda item: item[1], reverse=True)
+    if len(weighted_items) > ESTIMATION_TOP_TOKENS_MAX:
+        weighted_items = weighted_items[:ESTIMATION_TOP_TOKENS_MAX]
+
+    token_weights = dict(weighted_items)
+    total_weight = sum(weight for _, weight in weighted_items)
     if total_weight <= 0.0:
         return None
 
@@ -1277,7 +1516,7 @@ def maybe_duck_from_lyrics(
     poll_seconds: float,
     transcript: str,
 ) -> None:
-    transcript = transcript.strip().lower()
+    transcript = transcript.strip()
 
     if spotify_token:
         _apply_pending_track_lyrics_fetch(state)
@@ -1285,7 +1524,8 @@ def maybe_duck_from_lyrics(
     now = time.time()
     if spotify_token and (now - state.last_poll_time >= poll_seconds):
         state.last_poll_time = now
-        current = get_current_spotify_track(spotify_token)
+        spotify_timeout_seconds = min(SPOTIFY_POLL_TIMEOUT_SECONDS_MAX, max(1.2, poll_seconds * 3.0))
+        current = get_current_spotify_track(spotify_token, timeout_seconds=spotify_timeout_seconds)
         if current and current.get("is_playing"):
             track_id = str(current["track_id"])
             track_name = str(current["track_name"])
@@ -1343,14 +1583,35 @@ def maybe_duck_from_lyrics(
                 state.ordered_track_ids,
             )
 
+        if state.lyrics_library and not state.lyrics_library_token_track_frequency:
+            state.lyrics_library_token_track_frequency = build_library_token_track_frequency(state.lyrics_library)
+
         if transcript:
             _accumulate_transcript_tokens(state, transcript)
+
+        current_token_count = len(state.transcript_token_counts)
+        if current_token_count < 3:
+            return
+
+        elapsed_since_attempt = now - state.last_identify_attempt_wall_time
+        can_attempt = False
+        if current_token_count > state.last_identify_token_count:
+            can_attempt = elapsed_since_attempt >= ESTIMATION_IDENTIFY_MIN_INTERVAL_SECONDS
+        else:
+            can_attempt = elapsed_since_attempt >= (ESTIMATION_IDENTIFY_MIN_INTERVAL_SECONDS * 2.0)
+
+        if not can_attempt:
+            return
+
+        state.last_identify_attempt_wall_time = now
+        state.last_identify_token_count = current_token_count
 
         search_text = " ".join(state.transcript_history[-3:])
         identified = identify_track_from_accumulated_tokens(
             transcript_token_counts=state.transcript_token_counts,
             recent_transcript=search_text,
             library=state.lyrics_library,
+            token_track_frequency=state.lyrics_library_token_track_frequency,
         )
         if identified is not None:
             track, line_index, aligned_ms, score = identified
@@ -1643,8 +1904,43 @@ def _loopback_from_speaker(speaker: Any):
         return None
 
 
+def _loopback_hint() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return (
+            "On macOS, install a virtual audio device such as BlackHole, then select it with "
+            "--input-device (or route Spotify through a Multi-Output Device that includes BlackHole)."
+        )
+    if system == "Linux":
+        return (
+            "On Linux, ensure PulseAudio/PipeWire monitor sources are available "
+            "(pactl list sources | grep monitor), or pass a monitor device via --input-device."
+        )
+    return "Use --list-devices and optionally set --input-device."
+
+
+def _loopback_score(mic: Any, preferred_name: str, speaker_name: str) -> tuple[int, str]:
+    name = str(getattr(mic, "name", ""))
+    normalized = _normalize_name(name)
+    score = 0
+
+    if preferred_name and preferred_name in normalized:
+        score += 100
+    if getattr(mic, "isloopback", False):
+        score += 40
+    if ".monitor" in normalized or normalized.endswith(" monitor"):
+        score += 35
+    if any(token in normalized for token in ("blackhole", "soundflower", "loopback", "vb-audio", "cable")):
+        score += 30
+    if speaker_name and speaker_name in normalized:
+        score += 20
+
+    return score, normalized
+
+
 def find_loopback_mic(preferred_name: str = ""):
     speakers = list(sc.all_speakers())
+    preferred_normalized = _normalize_name(preferred_name)
     selected_speaker = _find_by_name(speakers, preferred_name)
     if selected_speaker is None:
         selected_speaker = sc.default_speaker()
@@ -1653,27 +1949,33 @@ def find_loopback_mic(preferred_name: str = ""):
         raise RuntimeError("No speaker output found on this machine.")
 
     loopback = _loopback_from_speaker(selected_speaker)
+    if loopback is not None and (not preferred_normalized or preferred_normalized in _normalize_name(getattr(loopback, "name", ""))):
+        return loopback
 
-    if loopback is None:
-        loopback_mics = [mic for mic in sc.all_microphones(include_loopback=True) if getattr(mic, "isloopback", False)]
-        loopback = _find_by_name(loopback_mics, preferred_name)
-        if loopback is None:
-            speaker_name = _normalize_name(getattr(selected_speaker, "name", ""))
-            for mic in loopback_mics:
-                mic_name = _normalize_name(getattr(mic, "name", ""))
-                if speaker_name and speaker_name in mic_name:
-                    loopback = mic
-                    break
+    candidates = list(sc.all_microphones(include_loopback=True))
+    speaker_name = _normalize_name(getattr(selected_speaker, "name", ""))
+    ranked = sorted(
+        candidates,
+        key=lambda mic: _loopback_score(mic, preferred_normalized, speaker_name),
+        reverse=True,
+    )
 
-        if loopback is None and loopback_mics:
-            loopback = loopback_mics[0]
+    for mic in ranked:
+        score, _ = _loopback_score(mic, preferred_normalized, speaker_name)
+        if score <= 0 and preferred_normalized:
+            continue
+        if score > 0 or getattr(mic, "isloopback", False) or ".monitor" in _normalize_name(getattr(mic, "name", "")):
+            return mic
 
-    if loopback is None:
-        raise RuntimeError(
-            "No loopback capture device found. Use --list-devices and optionally set --input-device."
-        )
+    if preferred_normalized:
+        matched = _find_by_name(candidates, preferred_name)
+        if matched is not None:
+            return matched
 
-    return loopback
+    raise RuntimeError(
+        "No loopback capture device found. "
+        + _loopback_hint()
+    )
 
 
 def main() -> int:
@@ -1968,7 +2270,7 @@ def main() -> int:
                 continue
 
             try:
-                transcript = transcribe_chunk(current_model, chunk, args.language).lower()
+                transcript = transcribe_chunk(current_model, chunk, args.language).strip()
             except OSError as exc:
                 print(f"[transcribe] warning: {exc}", flush=True)
                 continue

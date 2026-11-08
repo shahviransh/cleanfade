@@ -54,7 +54,10 @@ jobs:
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            libasound2-dev \
+            portaudio19-dev \
+            pulseaudio-utils
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -70,20 +73,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
-      - name: Build sidecar (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: |
-          python -m PyInstaller --noconfirm --clean --onefile --noconsole --name cleanfade-engine --distpath src-tauri/bin --workpath .pybuild/work --specpath .pybuild/spec --collect-data faster_whisper --collect-submodules faster_whisper spotify_duck.py
-          Copy-Item -Path src-tauri/bin/cleanfade-engine.exe -Destination src-tauri/bin/cleanfade-engine-${{ matrix.target }}.exe -Force
-
-      - name: Build sidecar (Linux/macOS)
-        if: matrix.platform != 'windows-latest'
-        shell: bash
-        run: |
-          python -m PyInstaller --noconfirm --clean --onefile --name cleanfade-engine --distpath src-tauri/bin --workpath .pybuild/work --specpath .pybuild/spec --collect-data faster_whisper --collect-submodules faster_whisper spotify_duck.py
-          cp src-tauri/bin/cleanfade-engine src-tauri/bin/cleanfade-engine-${{ matrix.target }}
-          chmod +x src-tauri/bin/cleanfade-engine src-tauri/bin/cleanfade-engine-${{ matrix.target }}
+      - name: Build sidecar
+        env:
+          CLEANFADE_PYTHON: python
+          CLEANFADE_TARGET_TRIPLE: ${{ matrix.target }}
+        run: python scripts/build_sidecar.py
 
       - name: Verify sidecar files
         shell: bash

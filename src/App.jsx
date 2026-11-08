@@ -267,7 +267,7 @@ function App() {
               Custom profanity file (optional)
               <span className="help-dot" tabIndex={0} data-tip="Optional path to a text file with one profanity word per line.">?</span>
             </span>
-            <input type="text" placeholder="C:/path/to/words.txt" value={form.profanityFile} onChange={onText("profanityFile")} />
+            <input type="text" placeholder="/path/to/words.txt" value={form.profanityFile} onChange={onText("profanityFile")} />
           </label>
 
           <label className="wide">
@@ -298,7 +298,7 @@ function App() {
               Playlist CSV paths
               <span className="help-dot" tabIndex={0} data-tip="Paste one or more CSV file paths (one per line). Supports Exportify and TuneMyMusic formats.">?</span>
             </span>
-            <textarea rows="3" placeholder={"C:/path/your-songs-Exportify.csv\nC:/path/your-songs-TuneMyMusic.csv"} value={form.playlistCsvPaths} onChange={onText("playlistCsvPaths")}></textarea>
+            <textarea rows="3" placeholder={"/path/your-songs-Exportify.csv\n/path/your-songs-TuneMyMusic.csv"} value={form.playlistCsvPaths} onChange={onText("playlistCsvPaths")}></textarea>
           </label>
 
           <label>

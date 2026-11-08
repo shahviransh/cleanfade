@@ -4,6 +4,17 @@
   "description": "Default capability for CleanFade",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "shell:allow-kill",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "bin/cleanfade-engine",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
   ]
 }
